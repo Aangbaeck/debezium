@@ -384,7 +384,10 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
         // change within its transaction and is what a replay skips through on restart.
         offsetContext.setScn(event.getCheckpointScn());
         offsetContext.setScnIndex(event.getCheckpointIndex());
-        offsetContext.setEventScn(event.getCheckpointScn());
+        // source.scn is the SCN of the row's own redo record when the message carries one (OpenLogReplicator
+        // scn-type with the DML bit set), as the LogMiner adapter reports it; c_scn positions the stream and
+        // remains the offset.
+        offsetContext.setEventScn(event.getScn() != null && !event.getScn().isNull() ? event.getScn() : event.getCheckpointScn());
         offsetContext.setTransactionId(event.getXid());
         offsetContext.tableEvent(tableId, event.getTimestamp());
         offsetContext.setRowId(mutationEvent.getRid());
