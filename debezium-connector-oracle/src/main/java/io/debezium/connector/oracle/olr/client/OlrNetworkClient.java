@@ -65,9 +65,6 @@ public class OlrNetworkClient {
     private Selector selector;
     private ByteBuffer payloadBuffer;
     private volatile boolean disconnected;
-    private boolean skipToStartScn;
-    private boolean notifiedSkip;
-    private Scn startScn;
     private long prevScn;
 
     /**
@@ -99,7 +96,6 @@ public class OlrNetworkClient {
                 return false;
             }
 
-            this.startScn = scn;
             if (!startFrom(scn, index)) {
                 return false;
             }
@@ -179,48 +175,12 @@ public class OlrNetworkClient {
             return null;
         }
 
-        // Logged before the start SCN check so that skipped events are recorded too.
         LOGGER.trace("Received Event: {}", event);
-
-        if (skipToStartScn && !isStartScnReached(event)) {
-            return null;
-        }
-
         return event;
     }
 
     public void confirm(Scn scn, Long index) {
         confirm(scn.longValue(), index);
-    }
-
-    /**
-     * Checks whether the change stream has advanced to the requested start system change number,
-     * discarding the event when it precedes that point.
-     *
-     * <p>Discarded events are not confirmed. A change carries the system change number of its own
-     * commit block, which is at or below the number the change itself was made at, so a change that
-     * is still wanted can belong to a commit block that precedes one being discarded here.
-     * Confirming a discarded event would release that commit block before it has been streamed, and
-     * OpenLogReplicator only sends what follows a confirmed position. The server is instead allowed
-     * to release these once the connector confirms a position it has emitted from.
-     *
-     * @param event the event that was read from the change stream, never {@code null}
-     * @return {@code true} if the event should be emitted, {@code false} if it should be skipped
-     */
-    private boolean isStartScnReached(StreamingEvent event) {
-        // todo: what if we restart mid-transaction?
-        if (event.getScn().compareTo(startScn) < 0) {
-            LOGGER.trace("Skipped event at SCN {}, has not yet reached start SCN {}: {}", event.getScn(), startScn, event);
-            if (!notifiedSkip) {
-                LOGGER.info("Advancing change stream to SCN {}", startScn);
-                notifiedSkip = true;
-            }
-            return false;
-        }
-
-        skipToStartScn = false;
-        LOGGER.info("Stream advanced, reading stream starting at {}", event.getScn());
-        return true;
     }
 
     private StreamingEvent readNextEvent() {
@@ -247,12 +207,13 @@ public class OlrNetworkClient {
     }
 
     private boolean startFrom(Scn scn, Long index) {
+        // No client-side filter by SCN: OpenLogReplicator sends a transaction on START only when it commits after the
+        // start SCN, and on CONTINUE only after (c_scn, c_idx). A transaction open at the start SCN carries rows below it.
         if (index != null) {
             LOGGER.info("Streaming will start at SCN {} with index {}.", scn, index);
         }
         else {
             LOGGER.info("Streaming will start at SCN {}.", scn);
-            skipToStartScn = true;
         }
         send(createRequest(RequestCode.INFO).build());
 
