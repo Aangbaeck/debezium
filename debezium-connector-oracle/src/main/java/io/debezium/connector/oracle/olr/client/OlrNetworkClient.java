@@ -16,11 +16,15 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.fasterxml.jackson.core.ErrorReportConfiguration;
 import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonLocation;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.databind.DeserializationFeature;
@@ -55,10 +59,17 @@ public class OlrNetworkClient {
 
     private static final int MESSAGE_SIZE_LENGTH = 4;
     private static final Duration READ_TIMEOUT = Duration.ofSeconds(1);
+    private static final int HEADER_SCAN_LENGTH = 256;
+    private static final Pattern HEADER_POSITION = Pattern.compile("\"(scn|c_scn|c_idx)\":\"?([0-9A-Za-z]{1,32})");
 
     // A frame carries a 32-bit length, so no string in it can exceed Integer.MAX_VALUE; LOB values exceed Jackson's 20M default
+    // Row values must not reach the logs through a parse error, so Jackson reports no source content and cuts tokens short
     private final ObjectMapper mapper = new ObjectMapper(JsonFactory.builder()
             .streamReadConstraints(StreamReadConstraints.builder().maxStringLength(Integer.MAX_VALUE).build())
+            .errorReportConfiguration(ErrorReportConfiguration.builder()
+                    .maxErrorTokenLength(0)
+                    .maxRawContentLength(0)
+                    .build())
             .build())
             .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
     private final String hostName;
@@ -199,8 +210,31 @@ public class OlrNetworkClient {
             return mapper.readValue(data, StreamingEvent.class);
         }
         catch (JsonProcessingException e) {
-            throw new OlrNetworkClientException("Failed to deserialize network packet: " + data, e);
+            throw new OlrNetworkClientException("Failed to deserialize network packet: " + describePacket(data, message.limit(), e), e);
         }
+    }
+
+    /**
+     * Describes where a packet that failed to deserialize is and where in it the error is, without
+     * any of the row values it carries.
+     */
+    private static String describePacket(String data, int length, JsonProcessingException error) {
+        final StringBuilder description = new StringBuilder();
+        // The position fields precede the payload, so only the packet's head is searched for them
+        int headerEnd = data.indexOf("\"payload\"");
+        headerEnd = Math.min(headerEnd < 0 ? data.length() : headerEnd, HEADER_SCAN_LENGTH);
+        final Matcher matcher = HEADER_POSITION.matcher(data).region(0, headerEnd);
+        while (matcher.find()) {
+            description.append(matcher.group(1)).append('=').append(matcher.group(2)).append(", ");
+        }
+        description.append("length=").append(length);
+        final JsonLocation location = error.getLocation();
+        if (location != null) {
+            description.append(", offset=").append(location.getCharOffset())
+                    .append(", line=").append(location.getLineNr())
+                    .append(", column=").append(location.getColumnNr());
+        }
+        return description.append(": ").append(error.getOriginalMessage()).toString();
     }
 
     private void confirm(long newScn, Long index) {
