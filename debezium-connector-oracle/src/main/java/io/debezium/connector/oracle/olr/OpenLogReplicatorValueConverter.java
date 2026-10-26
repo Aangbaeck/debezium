@@ -8,6 +8,7 @@ package io.debezium.connector.oracle.olr;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.sql.SQLException;
+import java.time.DateTimeException;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
@@ -157,7 +158,7 @@ public class OpenLogReplicatorValueConverter extends OracleValueConverters {
             final String[] valueBits = valueStr.split(",");
 
             final Instant instant = toInstantFromEpochNanos(new BigInteger(valueBits[0]));
-            final ZoneId zoneId = getZoneIdFromTimeZone(valueBits[1]);
+            final ZoneId zoneId = getZoneIdFromTimeZone(valueBits[1], valueStr);
             if (temporalPrecisionMode == TemporalPrecisionMode.STRUCTURED) {
                 return super.convertTimestampWithZone(column, fieldDefn, OffsetDateTime.ofInstant(instant, zoneId));
             }
@@ -231,13 +232,21 @@ public class OpenLogReplicatorValueConverter extends OracleValueConverters {
         return value;
     }
 
-    private ZoneId getZoneIdFromTimeZone(String timeZone) {
+    private ZoneId getZoneIdFromTimeZone(String timeZone, String value) {
         // OpenLogReplicator time zone varies, sometimes "HH:MM" and others Java TimeZone.
-        if (timeZone.contains(":")) {
-            return ZoneOffset.of(timeZone);
+        try {
+            if (timeZone.contains(":")) {
+                return ZoneOffset.of(timeZone);
+            }
+            final TimeZone zone = TimeZone.getTimeZone(timeZone);
+            // TimeZone.getTimeZone() returns GMT for an id it does not know.
+            if (zone.getID().equals("GMT") && !timeZone.equals("GMT")) {
+                throw new DateTimeException("Unknown time zone id: " + timeZone);
+            }
+            return zone.toZoneId();
         }
-        else {
-            return TimeZone.getTimeZone(timeZone).toZoneId();
+        catch (DateTimeException e) {
+            throw new DebeziumException("Unexpected time zone in timestamp with time zone value: " + value, e);
         }
     }
 
