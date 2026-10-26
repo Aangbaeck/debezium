@@ -20,7 +20,9 @@ import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
@@ -54,7 +56,10 @@ public class OlrNetworkClient {
     private static final int MESSAGE_SIZE_LENGTH = 4;
     private static final Duration READ_TIMEOUT = Duration.ofSeconds(1);
 
-    private final ObjectMapper mapper = new ObjectMapper()
+    // A frame carries a 32-bit length, so no string in it can exceed Integer.MAX_VALUE; LOB values exceed Jackson's 20M default
+    private final ObjectMapper mapper = new ObjectMapper(JsonFactory.builder()
+            .streamReadConstraints(StreamReadConstraints.builder().maxStringLength(Integer.MAX_VALUE).build())
+            .build())
             .enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
     private final String hostName;
     private final int port;
