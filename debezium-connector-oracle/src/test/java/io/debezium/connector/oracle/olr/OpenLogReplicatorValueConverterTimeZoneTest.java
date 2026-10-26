@@ -13,6 +13,8 @@ import java.time.Instant;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.Mockito;
 
 import io.debezium.DebeziumException;
@@ -49,6 +51,16 @@ public class OpenLogReplicatorValueConverterTimeZoneTest {
     @Test
     public void shouldConvertGmt() {
         assertThat(convert(EPOCH_NANOS + ",GMT")).isEqualTo("2026-07-01T12:00:00.000000+00:00");
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "ROC, 2026-07-01T20:00:00.000000+08:00",
+            "US/Pacific-New, 2026-07-01T05:00:00.000000-07:00",
+            "Canada/East-Saskatchewan, 2026-07-01T06:00:00.000000-06:00"
+    })
+    public void shouldConvertOracleRegionUnknownToJava(String region, String expected) {
+        assertThat(convert(EPOCH_NANOS + "," + region)).isEqualTo(expected);
     }
 
     @Test

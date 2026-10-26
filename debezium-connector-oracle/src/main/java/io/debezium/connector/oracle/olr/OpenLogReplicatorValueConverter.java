@@ -53,6 +53,11 @@ public class OpenLogReplicatorValueConverter extends OracleValueConverters {
     private static final String PRECISION = "%precision%";
     private static final String TIMESTAMP_TIME_ZONE_FORMAT = "yyyy-MM-dd'T'HH:mm:ss." + PRECISION + "xxxxx";
     private static final String TIMESTAMP_LOCAL_TIME_ZONE_FORMAT = "yyyy-MM-dd'T'HH:mm:ss." + PRECISION + "XXXX";
+    // Oracle region names that are no longer in the JDK time zone database, mapped to their IANA equivalents.
+    private static final Map<String, String> ORACLE_LEGACY_REGIONS = Map.of(
+            "ROC", "Asia/Taipei",
+            "US/Pacific-New", "America/Los_Angeles",
+            "Canada/East-Saskatchewan", "America/Regina");
 
     private final Map<Integer, DateTimeFormatter> timestampWithTimeZoneFormatterCache = new HashMap<>();
     private final Map<Integer, DateTimeFormatter> timestampWithLocalTimeZoneFormatterCache = new HashMap<>();
@@ -238,7 +243,7 @@ public class OpenLogReplicatorValueConverter extends OracleValueConverters {
             if (timeZone.contains(":")) {
                 return ZoneOffset.of(timeZone);
             }
-            final TimeZone zone = TimeZone.getTimeZone(timeZone);
+            final TimeZone zone = TimeZone.getTimeZone(ORACLE_LEGACY_REGIONS.getOrDefault(timeZone, timeZone));
             // TimeZone.getTimeZone() returns GMT for an id it does not know.
             if (zone.getID().equals("GMT") && !timeZone.equals("GMT")) {
                 throw new DateTimeException("Unknown time zone id: " + timeZone);
