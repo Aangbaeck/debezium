@@ -97,7 +97,8 @@ public class OlrNetworkClient {
     private Selector selector;
     private ByteBuffer payloadBuffer;
     private volatile boolean disconnected;
-    private long prevScn;
+    private long confirmedScn = -1;
+    private long confirmedIndex;
 
     /**
      * Create the OpenLogReplicator network client.
@@ -121,6 +122,18 @@ public class OlrNetworkClient {
      * @return true if the connection was established, false if the connection failed
      */
     public boolean connect(Scn scn, Long index) {
+        return connect(scn, scn, index);
+    }
+
+    /**
+     * Connect to the OpenLogReplicator process.
+     *
+     * @param scn the system change number a server that has not started yet begins reading redo at
+     * @param continueScn the c_scn a server that is already streaming continues after
+     * @param continueIndex the c_idx a server that is already streaming continues after
+     * @return true if the connection was established, false if the connection failed
+     */
+    public boolean connect(Scn scn, Scn continueScn, Long continueIndex) {
         if (scn == null || scn.isNull()) {
             throw new OlrNetworkClientException("Cannot connect and start with a null system change number");
         }
@@ -134,7 +147,7 @@ public class OlrNetworkClient {
                 return false;
             }
 
-            if (!startFrom(scn, index)) {
+            if (!startFrom(scn, continueScn, continueIndex)) {
                 return false;
             }
 
@@ -320,15 +333,23 @@ public class OlrNetworkClient {
         return description.append(": ").append(error.getOriginalMessage()).toString();
     }
 
+    /**
+     * Sends a CONFIRM for the position unless an equal or later one was already confirmed on this
+     * connection, so the confirmed position only moves forward.
+     */
     private void confirm(long newScn, Long index) {
-        if (prevScn != 0 && prevScn < newScn && index != null) {
+        if (index == null) {
+            return;
+        }
+        if (newScn > confirmedScn || (newScn == confirmedScn && index > confirmedIndex)) {
             LOGGER.debug("Confirming SCN {} with index {}", newScn, index);
             send(createRequest(RequestCode.CONFIRM).setCScn(newScn).setCIdx(index).build());
+            confirmedScn = newScn;
+            confirmedIndex = index;
         }
-        prevScn = newScn;
     }
 
-    private boolean startFrom(Scn scn, Long index) {
+    private boolean startFrom(Scn scn, Scn continueScn, Long index) {
         // No client-side filter by SCN: OpenLogReplicator sends a transaction on START only when it commits after the
         // start SCN, and on CONTINUE only after (c_scn, c_idx). A transaction open at the start SCN carries rows below it.
         if (index != null) {
@@ -344,14 +365,14 @@ public class OlrNetworkClient {
             return false;
         }
         else if (response.getCode() == ResponseCode.REPLICATE) {
-            LOGGER.info("OpenLogReplicator has already started, continue from SCN {}", scn);
+            LOGGER.info("OpenLogReplicator has already started, continue from SCN {} index {}", continueScn, index != null ? index : 0);
             // The position a source is continued from is carried by c_scn and c_idx. The system
             // change number on its own says where to begin reading redo, which only applies to
             // starting a source, and is ignored when continuing one. Sending it there leaves the
             // server to continue from whatever it last had confirmed instead, which is as far back
             // as it still holds, so it streams changes that were emitted long ago.
             send(createRequest(RequestCode.CONTINUE)
-                    .setCScn(scn.longValue())
+                    .setCScn(continueScn.longValue())
                     .setCIdx(index != null ? index : 0)
                     .build());
         }

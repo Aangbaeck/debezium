@@ -40,7 +40,14 @@ public class OpenLogReplicatorOracleOffsetContextLoader implements OffsetContext
                 .snapshotCompleted(loadSnapshotCompleted(offset))
                 .transactionContext(TransactionContext.load(offset))
                 .incrementalSnapshotContext(SignalBasedIncrementalSnapshotContext.load(offset))
+                .completedPosition(OracleOffsetContext.getScnFromOffsetMapByKey(offset, OracleOffsetContext.OLR_COMPLETED_SCN_KEY),
+                        loadCompletedScnIndex(offset))
                 .build();
+    }
+
+    private static Long loadCompletedScnIndex(Map<String, ?> offset) {
+        final Object index = offset.get(OracleOffsetContext.OLR_COMPLETED_SCN_INDEX_KEY);
+        return index instanceof Number number ? number.longValue() : null;
     }
 
 }

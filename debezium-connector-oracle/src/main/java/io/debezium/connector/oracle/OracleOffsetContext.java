@@ -28,10 +28,20 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
     public static final String SNAPSHOT_PENDING_TRANSACTIONS_KEY = "snapshot_pending_tx";
     public static final String SNAPSHOT_SCN_KEY = "snapshot_scn";
     public static final String WINDOW_ADVANCE_ENABLED_KEY = "window_advance_enabled";
+    public static final String OLR_COMPLETED_SCN_KEY = "olr_c_scn";
+    public static final String OLR_COMPLETED_SCN_INDEX_KEY = "olr_c_idx";
 
     private final Schema sourceInfoSchema;
 
     private boolean windowAdvanceEnabled;
+
+    /**
+     * OpenLogReplicator only: the stream position (c_scn, c_idx) through which every message belongs to a
+     * transaction that was emitted completely, or to a checkpoint. Kept apart from the SCN so that the position a
+     * restart reads redo from does not move past a transaction that is still open in the database.
+     */
+    private Scn completedScn;
+    private Long completedScnIndex;
 
     private final TransactionContext transactionContext;
     private final IncrementalSnapshotContext<TableId> incrementalSnapshotContext;
@@ -103,6 +113,8 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
         private Long transactionSequence;
         private CommitScn commitScn = CommitScn.empty();
         private boolean windowAdvanceEnabled;
+        private Scn completedScn;
+        private Long completedScnIndex;
 
         public Builder logicalName(OracleConnectorConfig connectorConfig) {
             this.connectorConfig = connectorConfig;
@@ -174,10 +186,18 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
             return this;
         }
 
+        public Builder completedPosition(Scn completedScn, Long completedScnIndex) {
+            this.completedScn = completedScn;
+            this.completedScnIndex = completedScnIndex;
+            return this;
+        }
+
         public OracleOffsetContext build() {
-            return new OracleOffsetContext(connectorConfig, scn, scnIndex, commitScn, lcrPosition, snapshotScn,
+            final OracleOffsetContext context = new OracleOffsetContext(connectorConfig, scn, scnIndex, commitScn, lcrPosition, snapshotScn,
                     snapshotPendingTransactions, snapshot, snapshotCompleted, transactionContext,
                     incrementalSnapshotContext, transactionId, transactionSequence, windowAdvanceEnabled);
+            context.setCompletedPosition(completedScn, completedScnIndex);
+            return context;
         }
     }
 
@@ -210,6 +230,10 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
             }
             if (sourceInfo.getScnIndex() != null) {
                 result.put(SourceInfo.SCN_INDEX_KEY, sourceInfo.getScnIndex());
+            }
+            if (completedScn != null) {
+                result.put(OLR_COMPLETED_SCN_KEY, completedScn.toString());
+                result.put(OLR_COMPLETED_SCN_INDEX_KEY, completedScnIndex);
             }
         }
 
@@ -320,6 +344,31 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
         this.windowAdvanceEnabled = true;
     }
 
+    public Scn getCompletedScn() {
+        return completedScn;
+    }
+
+    public Long getCompletedScnIndex() {
+        return completedScnIndex;
+    }
+
+    /**
+     * Sets the OpenLogReplicator position through which the stream has been emitted completely.
+     *
+     * @param completedScn the c_scn of the position, {@code null} if there is none
+     * @param completedScnIndex the c_idx of the position, ignored when {@code completedScn} is {@code null}
+     */
+    public void setCompletedPosition(Scn completedScn, Long completedScnIndex) {
+        if (completedScn == null || completedScn.isNull()) {
+            this.completedScn = null;
+            this.completedScnIndex = null;
+        }
+        else {
+            this.completedScn = completedScn;
+            this.completedScnIndex = completedScnIndex != null ? completedScnIndex : 0L;
+        }
+    }
+
     public void setTransactionId(String transactionId) {
         sourceInfo.setTransactionId(transactionId);
     }
@@ -401,6 +450,10 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
             if (getTransactionSequence() != null) {
                 sb.append(", txSeq=").append(getTransactionSequence());
             }
+        }
+
+        if (completedScn != null) {
+            sb.append(", olr_c_scn=").append(completedScn).append(", olr_c_idx=").append(completedScnIndex);
         }
 
         sb.append(", commit_scn=").append(sourceInfo.getCommitScn().toLoggableFormat());

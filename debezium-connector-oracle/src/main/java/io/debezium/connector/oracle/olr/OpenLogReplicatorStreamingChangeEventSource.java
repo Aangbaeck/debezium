@@ -77,6 +77,11 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
     private OffsetActivityMonitor<OraclePartition, OracleOffsetContext> offsetActivityMonitor;
     private boolean transactionEvents = false;
     /**
+     * Whether a transaction's begin was read and its commit not yet. A checkpoint is never sent between the
+     * two, this only keeps one from completing a transaction that is being read.
+     */
+    private boolean inTransaction = false;
+    /**
      * The position the connector had emitted up to when it last stopped.
      *
      * <p>Streaming resumes at the start of the transaction that position falls in, so the changes
@@ -145,18 +150,23 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
             // asking it to resume mid-transaction relies on it cutting the stream in exactly the
             // right place. Replaying the transaction and discarding what was already emitted, the
             // way the LogMiner adapter does, removes that dependency.
-            Long startScnIndex = offsetScnIndex;
             if (offsetScnIndex != null) {
                 replayScn = startScn;
                 replayScnIndex = offsetScnIndex;
                 replayTransactionId = offsetContext.getTransactionId();
-                startScnIndex = 0L;
                 LOGGER.info("Replaying transaction {} at SCN {} from its start, skipping through index {}.",
                         replayTransactionId, replayScn, replayScnIndex);
             }
+            inTransaction = false;
+
+            // A server that is already streaming still holds what follows the last position this
+            // connector confirmed, so it continues from there; a server that starts reads redo again
+            // from the offset SCN.
+            final Position continuePosition = Position.resumeFrom(startScn,
+                    offsetContext.getCompletedScn(), offsetContext.getCompletedScnIndex());
 
             this.client = new OlrNetworkClient(connectorConfig);
-            if (client.connect(startScn, startScnIndex)) {
+            if (client.connect(startScn, continuePosition.scn(), continuePosition.index())) {
                 try {
                     // Start read loop
                     while (client.isConnected() && context.isRunning()) {
@@ -218,9 +228,15 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
      * that transaction itself available to be replayed. Confirming a position within the
      * transaction would release the part of it that a restart has to read again.
      *
-     * <p>Only changes that were dispatched move this position, which is what makes it safe to
-     * confirm. The checkpoint markers OpenLogReplicator streams alongside the changes are not
-     * ordered against them, so their positions cannot be used here.
+     * <p>Once the commit of a transaction, or a checkpoint read outside a transaction, has been
+     * committed with the offset, everything up to its position has been emitted, and that position is
+     * confirmed instead when it is further along. A server that is still streaming continues from it
+     * after a restart; a server that starts again reads redo from the offset SCN, and the replay skips
+     * the completed transaction by its identifier and index.
+     *
+     * <p>This relies on OpenLogReplicator stamping messages in commit order (c_scn never decreases
+     * along the stream), so that no message sent after a commit or a checkpoint carries a lower
+     * position.
      *
      * @param offset the offset that has been committed, never {@code null}
      */
@@ -235,7 +251,58 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
             return;
         }
 
-        client.confirm(scn, 0L);
+        final Object completedIndex = offset.get(OracleOffsetContext.OLR_COMPLETED_SCN_INDEX_KEY);
+        final Position position = Position.resumeFrom(scn,
+                OracleOffsetContext.getScnFromOffsetMapByKey(offset, OracleOffsetContext.OLR_COMPLETED_SCN_KEY),
+                completedIndex instanceof Number number ? number.longValue() : null);
+        client.confirm(position.scn(), position.index());
+    }
+
+    /**
+     * A position in the OpenLogReplicator stream, ordered by c_scn and then c_idx.
+     */
+    record Position(Scn scn, long index) {
+
+        /**
+         * The position to confirm and to continue from: the start of the offset SCN, or the completed
+         * position when that is further along.
+         *
+         * @param scn the offset SCN, never {@code null}
+         * @param completedScn the c_scn of the completed position, may be {@code null}
+         * @param completedIndex the c_idx of the completed position, may be {@code null}
+         */
+        static Position resumeFrom(Scn scn, Scn completedScn, Long completedIndex) {
+            final Position start = new Position(scn, 0L);
+            if (completedScn == null || completedScn.isNull()) {
+                return start;
+            }
+            final Position completed = new Position(completedScn, completedIndex != null ? completedIndex : 0L);
+            return completed.isAfter(start) ? completed : start;
+        }
+
+        boolean isAfter(Position other) {
+            final int comparison = scn.compareTo(other.scn);
+            return comparison > 0 || (comparison == 0 && index > other.index);
+        }
+    }
+
+    /**
+     * Records that the stream has been emitted completely through the event's position, if that is
+     * further along than the position recorded so far. The offset SCN is left where it is: it is
+     * where a restart reads redo from, and a transaction still open in the database may have begun
+     * before this position.
+     */
+    private void completeThrough(StreamingEvent event) {
+        final Scn scn = event.getCheckpointScn();
+        final Long index = event.getCheckpointIndex();
+        if (scn == null || scn.isNull() || index == null) {
+            return;
+        }
+        final Position position = new Position(scn, index);
+        final Scn completedScn = offsetContext.getCompletedScn();
+        if (completedScn == null || position.isAfter(new Position(completedScn, offsetContext.getCompletedScnIndex()))) {
+            offsetContext.setCompletedPosition(scn, index);
+        }
     }
 
     /**
@@ -268,7 +335,7 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
                 && event.getCheckpointIndex() <= replayScnIndex;
     }
 
-    private void onEvent(StreamingEvent event) throws Exception {
+    void onEvent(StreamingEvent event) throws Exception {
         for (PayloadEvent payloadEvent : event.getPayload()) {
             switch (payloadEvent.getType()) {
                 case BEGIN:
@@ -303,6 +370,7 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
         offsetContext.setEventScn(event.getCheckpointScn());
         offsetContext.setSourceTime(event.getTimestamp());
         transactionEvents = false;
+        inTransaction = true;
 
         // We do not specifically start a transaction boundary here.
         //
@@ -317,6 +385,11 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
 
         streamingMetrics.incrementCommittedTransactionCount();
 
+        // Every message of the transaction has been read and its changes dispatched. Set before the
+        // records below, which carry the offset that confirms it.
+        inTransaction = false;
+        completeThrough(event);
+
         // We may see empty transactions and in this case we don't want to emit a transaction boundary
         // record for these cases. Only trigger commit when there are valid changes.
         if (transactionEvents) {
@@ -330,14 +403,15 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
     }
 
     private void onCheckpointEvent(StreamingEvent event) throws InterruptedException {
-        // Checkpoint markers track how far OpenLogReplicator has read, which is not ordered against
-        // the changes it streams: a transaction is only sent once it commits, and its changes carry
-        // the system change number of that commit, which can be lower than a checkpoint that has
-        // already been sent. Moving the offset position here would therefore describe the stream as
-        // being further along than the changes the connector has actually been given, and the
-        // changes still owed would be filtered out as already seen after a restart.
+        // The offset SCN stays where it is: a restart reads redo from it, and a transaction that is
+        // still open in the database, so not sent yet, may have begun before this marker.
         offsetContext.setEventScn(event.getCheckpointScn());
         offsetContext.setSourceTime(event.getTimestamp());
+
+        // Everything sent before the marker has been read, so the stream is complete through it.
+        if (!inTransaction) {
+            completeThrough(event);
+        }
 
         dispatcher.alwaysDispatchHeartbeatEvent(partition, offsetContext);
     }
