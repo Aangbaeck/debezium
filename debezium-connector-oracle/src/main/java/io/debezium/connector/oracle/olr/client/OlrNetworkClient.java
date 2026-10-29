@@ -124,6 +124,7 @@ public class OlrNetworkClient {
         if (scn == null || scn.isNull()) {
             throw new OlrNetworkClientException("Cannot connect and start with a null system change number");
         }
+        boolean connected = false;
         try {
             channel = SocketChannel.open();
             // Before connecting, so the handshake is covered too
@@ -142,6 +143,7 @@ public class OlrNetworkClient {
             channel.configureBlocking(false);
             selector = Selector.open();
             channel.register(selector, SelectionKey.OP_READ);
+            connected = true;
             return true;
         }
         catch (ClosedByInterruptException e) {
@@ -150,6 +152,32 @@ public class OlrNetworkClient {
         }
         catch (IOException e) {
             throw new OlrNetworkClientException("Failed to connect and start", e);
+        }
+        finally {
+            // The caller only disconnects a client that connected
+            if (!connected) {
+                closeQuietly();
+            }
+        }
+    }
+
+    private void closeQuietly() {
+        if (selector != null) {
+            try {
+                selector.close();
+            }
+            catch (IOException e) {
+                // ignored
+            }
+            selector = null;
+        }
+        if (channel != null) {
+            try {
+                channel.close();
+            }
+            catch (IOException e) {
+                // ignored
+            }
         }
     }
 

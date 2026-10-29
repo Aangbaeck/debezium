@@ -125,6 +125,33 @@ public class OlrNetworkClientKeepAliveTest {
         assertThat(new RetriableProbe(config).retriable(error)).isTrue();
     }
 
+    @Test
+    public void shouldCloseChannelWhenStartFails() throws Exception {
+        try (ServerSocket server = new ServerSocket(0)) {
+            final Thread olr = new Thread(() -> {
+                try (Socket socket = server.accept()) {
+                    // Closed before the handshake
+                }
+                catch (IOException e) {
+                    // the test fails on the client side
+                }
+            });
+            olr.setDaemon(true);
+            olr.start();
+
+            final OlrNetworkClient client = new OlrNetworkClient(config(server, Configuration.create().build()));
+            boolean connected = false;
+            try {
+                connected = client.connect(Scn.valueOf(100), null);
+            }
+            catch (OlrNetworkClientException e) {
+                // a failed start may throw or return false
+            }
+            assertThat(connected).isFalse();
+            assertThat(client.getChannel().isOpen()).isFalse();
+        }
+    }
+
     private static void assertKeepAlive(Configuration overrides, int idle, int interval, int count) throws Exception {
         try (ServerSocket server = new ServerSocket(0)) {
             final Thread olr = new Thread(() -> {

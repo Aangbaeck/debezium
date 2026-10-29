@@ -6246,6 +6246,7 @@ The connection then fails with a retriable error and the connector reconnects.
 |`6`
 |The number of unanswered TCP keepalive probes (`1` to `127`) after which the connection to OpenLogReplicator fails.
 With the defaults, a dead connection fails about 2 minutes after its last traffic.
+While the connector has sent data that the server has not acknowledged, for example a confirmation sent just after the server went away, the operating system sends no probes and its retransmission timeout applies instead, about 15 minutes on Linux by default.
 
 |===
 
