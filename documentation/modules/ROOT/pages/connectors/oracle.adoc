@@ -6212,7 +6212,7 @@ Omit `65536` if the tables you capture contain no `XMLTYPE` columns, and `64` if
 [[oracle-openlogreplicator-connector-properties]]
 === OpenLogReplicator connector properties
 
-The following configuration properties are required when using OpenLogReplicator.
+The following configuration properties apply when using OpenLogReplicator. The `source`, `host` and `port` properties are required.
 
 [cols="30%a,25%a,45%a"]
 |===
@@ -6231,6 +6231,21 @@ The following configuration properties are required when using OpenLogReplicator
 |[[oracle-property-openlogreplicator-port]]<<oracle-property-openlogreplicator-port, `+openlogreplicator.port+`>>
 |No default
 |The port number that is used by the OpenLogReplicator network service.
+
+|[[oracle-property-openlogreplicator-keepalive-idle-ms]]<<oracle-property-openlogreplicator-keepalive-idle-ms, `+openlogreplicator.keepalive.idle.ms+`>>
+|`60000` (1 minute)
+|How long the connection to OpenLogReplicator can carry no traffic before the operating system sends TCP keepalive probes, in milliseconds, rounded up to whole seconds (`1000` to `32767000`).
+OpenLogReplicator sends nothing while the database is quiet, so the probes are what detect a server that went away without closing the connection, for example a deleted pod.
+The connection then fails with a retriable error and the connector reconnects.
+
+|[[oracle-property-openlogreplicator-keepalive-interval-ms]]<<oracle-property-openlogreplicator-keepalive-interval-ms, `+openlogreplicator.keepalive.interval.ms+`>>
+|`10000` (10 seconds)
+|The time between unanswered TCP keepalive probes, in milliseconds, rounded up to whole seconds (`1000` to `32767000`).
+
+|[[oracle-property-openlogreplicator-keepalive-count]]<<oracle-property-openlogreplicator-keepalive-count, `+openlogreplicator.keepalive.count+`>>
+|`6`
+|The number of unanswered TCP keepalive probes (`1` to `127`) after which the connection to OpenLogReplicator fails.
+With the defaults, a dead connection fails about 2 minutes after its last traffic.
 
 |===
 

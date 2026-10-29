@@ -7,6 +7,8 @@ package io.debezium.connector.oracle.olr.client;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.SocketOption;
+import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.ClosedByInterruptException;
@@ -15,6 +17,7 @@ import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -30,12 +33,15 @@ import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import io.debezium.annotation.VisibleForTesting;
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.Scn;
 import io.debezium.connector.oracle.proto.OpenLogReplicatorProtocol.RedoRequest;
 import io.debezium.connector.oracle.proto.OpenLogReplicatorProtocol.RedoResponse;
 import io.debezium.connector.oracle.proto.OpenLogReplicatorProtocol.RequestCode;
 import io.debezium.connector.oracle.proto.OpenLogReplicatorProtocol.ResponseCode;
+
+import jdk.net.ExtendedSocketOptions;
 
 /**
  * An OpenLogReplicator network client that communicates using JSON streaming payloads.
@@ -50,6 +56,13 @@ import io.debezium.connector.oracle.proto.OpenLogReplicatorProtocol.ResponseCode
  * down rather than a network failure. Such an interrupt is handled internally by marking the client
  * as no longer connected, so that {@link #isConnected()} reports {@code false} and the caller's read
  * loop stops of its own accord instead of having to interpret a failure.
+ *
+ * <p>{@link #READ_TIMEOUT} only bounds a single poll and the caller polls again, so it never fails a
+ * connection. OpenLogReplicator sends nothing while the database is quiet, possibly for hours, so silence
+ * cannot tell a dead server from an idle one. TCP keepalive does: the operating system probes the idle
+ * connection and fails it when the probes go unanswered or are refused, for example after the server's
+ * pod was deleted without its connection being closed. The next read then throws an {@link IOException},
+ * which the connector treats as retriable and reconnects.
  *
  * @author Chris Cranford
  */
@@ -75,6 +88,9 @@ public class OlrNetworkClient {
     private final String hostName;
     private final int port;
     private final String sourceName;
+    private final Duration keepAliveIdle;
+    private final Duration keepAliveInterval;
+    private final int keepAliveCount;
     private final ByteBuffer sizeBuffer = ByteBuffer.allocate(MESSAGE_SIZE_LENGTH).order(ByteOrder.LITTLE_ENDIAN);
 
     private SocketChannel channel;
@@ -92,6 +108,9 @@ public class OlrNetworkClient {
         this.hostName = connectorConfig.getOpenLogReplicatorHostname();
         this.port = connectorConfig.getOpenLogReplicatorPort();
         this.sourceName = connectorConfig.getOpenLogReplicatorSource();
+        this.keepAliveIdle = connectorConfig.getOpenLogReplicatorKeepAliveIdle();
+        this.keepAliveInterval = connectorConfig.getOpenLogReplicatorKeepAliveInterval();
+        this.keepAliveCount = connectorConfig.getOpenLogReplicatorKeepAliveCount();
     }
 
     /**
@@ -107,6 +126,8 @@ public class OlrNetworkClient {
         }
         try {
             channel = SocketChannel.open();
+            // Before connecting, so the handshake is covered too
+            configureKeepAlive(channel);
             channel.configureBlocking(true);
             if (!channel.connect(new InetSocketAddress(hostName, port))) {
                 return false;
@@ -130,6 +151,40 @@ public class OlrNetworkClient {
         catch (IOException e) {
             throw new OlrNetworkClientException("Failed to connect and start", e);
         }
+    }
+
+    /**
+     * Enables TCP keepalive on the channel with the configured timings, so a connection whose server
+     * vanished fails within about idle + interval * count of its last traffic.
+     *
+     * <p>Where the per-socket timings are not supported the system-wide ones apply, which on Linux
+     * default to probing only after two hours of idle time.
+     */
+    private void configureKeepAlive(SocketChannel channel) throws IOException {
+        channel.setOption(StandardSocketOptions.SO_KEEPALIVE, true);
+        final Set<SocketOption<?>> supported = channel.supportedOptions();
+        if (!supported.contains(ExtendedSocketOptions.TCP_KEEPIDLE)
+                || !supported.contains(ExtendedSocketOptions.TCP_KEEPINTERVAL)
+                || !supported.contains(ExtendedSocketOptions.TCP_KEEPCOUNT)) {
+            LOGGER.warn("Per-connection TCP keepalive timings are not supported on this platform, the operating system "
+                    + "defaults apply to the OpenLogReplicator connection and may detect a lost server only after hours.");
+            return;
+        }
+        channel.setOption(ExtendedSocketOptions.TCP_KEEPIDLE, toSeconds(keepAliveIdle));
+        channel.setOption(ExtendedSocketOptions.TCP_KEEPINTERVAL, toSeconds(keepAliveInterval));
+        channel.setOption(ExtendedSocketOptions.TCP_KEEPCOUNT, keepAliveCount);
+        LOGGER.info("TCP keepalive on the OpenLogReplicator connection: idle {}s, interval {}s, count {}.",
+                toSeconds(keepAliveIdle), toSeconds(keepAliveInterval), keepAliveCount);
+    }
+
+    private static int toSeconds(Duration duration) {
+        // The socket options take whole seconds; round up so a configured value is never shortened
+        return (int) Math.max(1, (duration.toMillis() + 999) / 1000);
+    }
+
+    @VisibleForTesting
+    SocketChannel getChannel() {
+        return channel;
     }
 
     /**
