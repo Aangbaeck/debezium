@@ -8,6 +8,7 @@ package io.debezium.connector.oracle.olr.client;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketOption;
+import java.net.SocketTimeoutException;
 import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -47,11 +48,15 @@ import jdk.net.ExtendedSocketOptions;
 /**
  * An OpenLogReplicator network client that communicates using JSON streaming payloads.
  *
- * <p>The initial handshake is performed while the channel is in blocking mode as it consists of a
- * fixed request and response exchange. Once the server has entered streaming mode, the channel is
- * switched to non-blocking mode and {@link #readEvent()} waits at most {@link #READ_TIMEOUT} for a
- * complete message to arrive before returning {@code null}, buffering any partially received
- * message until the next call.
+ * <p>The channel is connected in blocking mode and switched to non-blocking mode for the handshake
+ * and the stream, so every read waits on a selector with a deadline; a blocking channel has no read
+ * timeout. {@link #readEvent()} waits at most {@link #READ_TIMEOUT} for a complete message to arrive
+ * before returning {@code null}, buffering any partially received message until the next call.
+ *
+ * <p>The answer to INFO must arrive within the configured INFO timeout. OpenLogReplicator serves one
+ * client at a time, and while it still holds the connection of an earlier client that vanished it
+ * accepts a new connection without answering. The answer to START is awaited without a limit, as the
+ * server may load its dictionary before it answers.
  *
  * <p>An interrupt raised while the client is communicating with the server is a request to shut
  * down rather than a network failure. Such an interrupt is handled internally by marking the client
@@ -92,6 +97,7 @@ public class OlrNetworkClient {
     private final Duration keepAliveIdle;
     private final Duration keepAliveInterval;
     private final int keepAliveCount;
+    private final Duration infoTimeout;
     private final ByteBuffer sizeBuffer = ByteBuffer.allocate(MESSAGE_SIZE_LENGTH).order(ByteOrder.LITTLE_ENDIAN);
 
     private SocketChannel channel;
@@ -117,6 +123,7 @@ public class OlrNetworkClient {
         this.keepAliveIdle = connectorConfig.getOpenLogReplicatorKeepAliveIdle();
         this.keepAliveInterval = connectorConfig.getOpenLogReplicatorKeepAliveInterval();
         this.keepAliveCount = connectorConfig.getOpenLogReplicatorKeepAliveCount();
+        this.infoTimeout = connectorConfig.getOpenLogReplicatorInfoTimeout();
         this.confirmCompletedTransactions = connectorConfig.isOpenLogReplicatorConfirmCompletedTransactions();
     }
 
@@ -153,15 +160,14 @@ public class OlrNetworkClient {
                 return false;
             }
 
-            if (!startFrom(scn, continueAfter)) {
-                return false;
-            }
-
-            // The handshake completed and the server is streaming, all subsequent reads are
-            // performed without blocking the caller.
+            // Reads wait on the selector with a deadline, from the handshake on
             channel.configureBlocking(false);
             selector = Selector.open();
             channel.register(selector, SelectionKey.OP_READ);
+
+            if (!startFrom(scn, continueAfter)) {
+                return false;
+            }
             connected = true;
             return true;
         }
@@ -388,7 +394,7 @@ public class OlrNetworkClient {
         LOGGER.info("Streaming will start at SCN {}.", scn);
         send(createRequest(RequestCode.INFO).build());
 
-        RedoResponse response = readResponse();
+        RedoResponse response = readInfoResponse();
         if (response == null) {
             return false;
         }
@@ -420,7 +426,8 @@ public class OlrNetworkClient {
             return false;
         }
 
-        response = readResponse();
+        // Unbounded: on START the server may load its dictionary before it answers
+        response = readResponse(null);
         if (response == null) {
             return false;
         }
@@ -438,14 +445,36 @@ public class OlrNetworkClient {
     }
 
     /**
-     * Reads a handshake response from the server, while the channel is still in blocking mode.
+     * Reads the answer to INFO, waiting at most the INFO timeout.
      *
      * @return the response, or {@code null} if the client was interrupted awaiting the response
+     * @throws OlrNetworkClientException caused by a {@link SocketTimeoutException} when no answer arrived in time
      */
-    private RedoResponse readResponse() {
-        final ByteBuffer response = read();
-        if (response == null) {
-            return null;
+    private RedoResponse readInfoResponse() {
+        final RedoResponse response = readResponse(infoTimeout);
+        if (response == null && !disconnected) {
+            // The cause is an IOException, so the error handler treats the failure as retriable
+            throw new OlrNetworkClientException("OpenLogReplicator accepted the connection to " + hostName + ":" + port
+                    + " but did not answer the INFO request within " + infoTimeout.toMillis() + " ms. It serves one client at a "
+                    + "time and may still hold the connection of an earlier client that went away; connecting again.",
+                    new SocketTimeoutException("No answer to INFO within " + infoTimeout.toMillis() + " ms"));
+        }
+        return response;
+    }
+
+    /**
+     * Reads a handshake response from the server.
+     *
+     * @param timeout how long to wait, to within {@link #READ_TIMEOUT}, or {@code null} to wait without a limit
+     * @return the response, or {@code null} if the client was interrupted or the timeout elapsed
+     */
+    private RedoResponse readResponse(Duration timeout) {
+        final long start = System.nanoTime();
+        ByteBuffer response;
+        while ((response = read()) == null) {
+            if (disconnected || (timeout != null && System.nanoTime() - start >= timeout.toNanos())) {
+                return null;
+            }
         }
         try {
             return RedoResponse.parseFrom(response.array());
@@ -457,7 +486,7 @@ public class OlrNetworkClient {
 
     /**
      * Reads the next message from the channel, waiting up to {@link #READ_TIMEOUT} for the message
-     * to arrive when the channel is in non-blocking mode.
+     * to arrive.
      *
      * <p>A message that has only partially arrived within that window is retained across calls so
      * that the next read resumes where the previous one left off.

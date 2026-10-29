@@ -669,6 +669,33 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     + "the connection to OpenLogReplicator; the connector then restarts and reconnects. With the defaults a dead "
                     + "connection fails about 120 seconds after its last traffic. Defaults to 6.");
 
+    public static final Field OLR_INFO_TIMEOUT_MS = Field.create("openlogreplicator.info.timeout.ms")
+            .withDisplayName("Time to wait for OpenLogReplicator to answer the INFO request (ms)")
+            .withType(Type.LONG)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.LOW)
+            .withDefault(30_000L)
+            .withValidation(OracleConnectorConfig::validateOlrTimeoutMs)
+            .withDescription("How long the connector waits for OpenLogReplicator to answer the INFO request that opens a "
+                    + "connection, in milliseconds (1 to 2147483647). OpenLogReplicator serves one client at a time; while it still holds the "
+                    + "connection of an earlier client that went away without closing it, the operating system accepts the new "
+                    + "connection but OpenLogReplicator does not read it. The connector then fails with a retriable error and "
+                    + "connects again, until OpenLogReplicator has dropped the old connection. The wait for the answer to START "
+                    + "is not limited, as OpenLogReplicator may load its dictionary first. Defaults to 30000.");
+
+    public static final Field OLR_FLUSHED_OFFSET_READ_TIMEOUT_MS = Field.create("openlogreplicator.flushed.offset.read.timeout.ms")
+            .withDisplayName("Time to wait for the flushed offset before confirming it to OpenLogReplicator (ms)")
+            .withType(Type.LONG)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.LOW)
+            .withDefault(10_000L)
+            .withValidation(OracleConnectorConfig::validateOlrTimeoutMs)
+            .withDescription("How long an offset commit waits for the offset Kafka Connect has flushed to be read back from "
+                    + "offset storage, in milliseconds (1 to 2147483647). The connector confirms that offset to OpenLogReplicator. The read "
+                    + "runs on a thread of its own; when it takes longer, the commit confirms nothing, logs a warning and "
+                    + "streaming goes on. A read still running is not started again, and its result is confirmed at the next "
+                    + "commit after it completes. Defaults to 10000.");
+
     public static final Field OLR_CONFIRM_COMPLETED_TRANSACTIONS = Field.create("openlogreplicator.confirm.completed.transactions")
             .withDisplayName("Confirm and continue past completed transactions with OpenLogReplicator")
             .withType(Type.BOOLEAN)
@@ -901,6 +928,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     LOG_MINING_READ_ONLY, LOG_MINING_FLUSH_TABLE_NAME, LOG_MINING_QUERY_FILTER_MODE, LOG_MINING_RESTART_CONNECTION, LOG_MINING_MAX_SCN_DEVIATION_MS,
                     LOG_MINING_SCHEMA_CHANGES_USERNAME_EXCLUDE_LIST, LOG_MINING_INCLUDE_REDO_SQL, OLR_SOURCE, OLR_HOST, OLR_PORT,
                     OLR_KEEPALIVE_IDLE_MS, OLR_KEEPALIVE_INTERVAL_MS, OLR_KEEPALIVE_COUNT, OLR_CONFIRM_COMPLETED_TRANSACTIONS,
+                    OLR_INFO_TIMEOUT_MS, OLR_FLUSHED_OFFSET_READ_TIMEOUT_MS,
                     LOG_MINING_BUFFER_EHCACHE_GLOBAL_CONFIG, LOG_MINING_BUFFER_EHCACHE_TRANSACTIONS_CONFIG, LOG_MINING_BUFFER_EHCACHE_PROCESSED_TRANSACTIONS_CONFIG,
                     LOG_MINING_BUFFER_EHCACHE_SCHEMA_CHANGES_CONFIG, LOG_MINING_BUFFER_EHCACHE_EVENTS_CONFIG,
                     LOG_MINING_SQL_RELAXED_QUOTE_DETECTION, LOG_MINING_CLIENTID_INCLUDE_LIST, LOG_MINING_CLIENTID_EXCLUDE_LIST, LOG_MINING_RESUME_POSITION_INTERVAL_MS,
@@ -1002,6 +1030,8 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     private final Duration openLogReplicatorKeepAliveInterval;
     private final int openLogReplicatorKeepAliveCount;
     private final boolean openLogReplicatorConfirmCompletedTransactions;
+    private final Duration openLogReplicatorInfoTimeout;
+    private final Duration openLogReplicatorFlushedOffsetReadTimeout;
 
     private final Duration resumePositionUpdateInterval;
 
@@ -1107,6 +1137,8 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
         this.openLogReplicatorKeepAliveInterval = Duration.ofMillis(config.getLong(OLR_KEEPALIVE_INTERVAL_MS));
         this.openLogReplicatorKeepAliveCount = config.getInteger(OLR_KEEPALIVE_COUNT);
         this.openLogReplicatorConfirmCompletedTransactions = config.getBoolean(OLR_CONFIRM_COMPLETED_TRANSACTIONS);
+        this.openLogReplicatorInfoTimeout = Duration.ofMillis(config.getLong(OLR_INFO_TIMEOUT_MS));
+        this.openLogReplicatorFlushedOffsetReadTimeout = Duration.ofMillis(config.getLong(OLR_FLUSHED_OFFSET_READ_TIMEOUT_MS));
 
         this.resumePositionUpdateInterval = Duration.ofMillis(config.getLong(LOG_MINING_RESUME_POSITION_INTERVAL_MS));
     }
@@ -2186,6 +2218,24 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     }
 
     /**
+     * Returns how long the OpenLogReplicator client waits for the answer to its INFO request.
+     *
+     * @return the timeout, never {@code null}
+     */
+    public Duration getOpenLogReplicatorInfoTimeout() {
+        return openLogReplicatorInfoTimeout;
+    }
+
+    /**
+     * Returns how long an offset commit waits for the flushed offset to be read back before confirming it.
+     *
+     * @return the timeout, never {@code null}
+     */
+    public Duration getOpenLogReplicatorFlushedOffsetReadTimeout() {
+        return openLogReplicatorFlushedOffsetReadTimeout;
+    }
+
+    /**
      * Get the Ehcache buffer configuration, which is all attributes under the configuration prefix
      * "log.mining.buffer.ehcache" namespace, with the prefix removed.
      *
@@ -2420,6 +2470,10 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
 
     public static int validateOlrKeepAliveCount(Configuration config, Field field, ValidationOutput problems) {
         return validateRange(config, field, problems, 1, OLR_KEEPALIVE_MAX_COUNT);
+    }
+
+    public static int validateOlrTimeoutMs(Configuration config, Field field, ValidationOutput problems) {
+        return validateRange(config, field, problems, 1, Integer.MAX_VALUE);
     }
 
     private static int validateRange(Configuration config, Field field, ValidationOutput problems, long min, long max) {

@@ -18,6 +18,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
+import io.debezium.annotation.VisibleForTesting;
 import io.debezium.bean.StandardBeanNames;
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
@@ -52,6 +53,7 @@ import io.debezium.snapshot.SnapshotterService;
 import io.debezium.spi.topic.TopicNamingStrategy;
 import io.debezium.util.Clock;
 import io.debezium.util.Strings;
+import io.debezium.util.Threads;
 
 public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleOffsetContext> {
 
@@ -71,6 +73,7 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
     private Partition.Provider<OraclePartition> partitionProvider = null;
     private OffsetContext.Loader<OracleOffsetContext> offsetContextLoader = null;
     private OracleConnectorConfig connectorConfig;
+    private volatile OlrFlushedOffsetReader<Offsets<OraclePartition, OracleOffsetContext>> flushedOffsetReader;
 
     @Override
     public String version() {
@@ -92,6 +95,9 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
         connectorAdapter = connectorConfig.getConnectorAdapter();
         partitionProvider = new OraclePartition.Provider(connectorConfig);
         offsetContextLoader = connectorConfig.getAdapter().getOffsetContextLoader();
+        if (ConnectorAdapter.OLR.equals(connectorAdapter)) {
+            startFlushedOffsetReader();
+        }
 
         TopicNamingStrategy<TableId> topicNamingStrategy = connectorConfig.getTopicNamingStrategy(CommonConnectorConfig.TOPIC_NAMING_STRATEGY);
         SchemaNameAdjuster schemaNameAdjuster = connectorConfig.schemaNameAdjuster();
@@ -269,6 +275,11 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
         if (queue != null) {
             queue.close();
         }
+
+        if (flushedOffsetReader != null) {
+            flushedOffsetReader.close();
+            flushedOffsetReader = null;
+        }
     }
 
     @Override
@@ -314,10 +325,29 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
     }
 
     /**
+     * Starts the reader of the flushed offset for {@link #commitFlushedOffsets()}, closing one left from an earlier start.
+     */
+    @VisibleForTesting
+    void startFlushedOffsetReader() {
+        if (flushedOffsetReader != null) {
+            flushedOffsetReader.close();
+        }
+        final Partition.Provider<OraclePartition> partitions = partitionProvider;
+        final OffsetContext.Loader<OracleOffsetContext> loader = offsetContextLoader;
+        flushedOffsetReader = new OlrFlushedOffsetReader<>(() -> getPreviousOffsets(partitions, loader),
+                connectorConfig.getOpenLogReplicatorFlushedOffsetReadTimeout(),
+                Threads.newSingleThreadExecutor(OracleConnector.class, connectorConfig.getLogicalName(), "olr-flushed-offset-reader", true));
+    }
+
+    /**
      * Hands the offset Kafka Connect has flushed to OpenLogReplicator's streaming source, which
      * confirms it to the server. The offset of the last record Kafka acknowledged is not used: Connect
      * flushes only offsets whose earlier records were all written, but acknowledgements on different
      * topics arrive in any order, so the last one can be ahead of records that may still fail.
+     *
+     * <p>This runs in {@code poll()}, so the offset is read on another thread with a timeout: a read
+     * that fails or takes too long skips this CONFIRM, which only delays releasing data in the server,
+     * and the next commit reads again.
      */
     private void commitFlushedOffsets() {
         final boolean locked = commitLock.tryLock();
@@ -328,22 +358,19 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
 
         try {
             final ChangeEventSourceCoordinator<OraclePartition, OracleOffsetContext> current = coordinator;
-            if (current == null) {
+            final OlrFlushedOffsetReader<Offsets<OraclePartition, OracleOffsetContext>> reader = flushedOffsetReader;
+            if (current == null || reader == null) {
                 return;
             }
-            final Offsets<OraclePartition, OracleOffsetContext> offsets = getPreviousOffsets(partitionProvider, offsetContextLoader);
-            if (offsets.getOffsets() != null) {
-                offsets.getOffsets().forEach((partition, offset) -> {
-                    if (offset != null) {
-                        LOGGER.debug("Committing flushed offset position '{}'", offset);
-                        current.commitOffset(partition.getSourcePartition(), offset.getOffset());
-                    }
-                });
-            }
-        }
-        catch (RuntimeException e) {
-            // A skipped CONFIRM only delays releasing data, the next commit confirms again
-            LOGGER.warn("Couldn't confirm the flushed offset with OpenLogReplicator, retrying at the next commit", e);
+            // Failures of the read are logged by the reader and give no offsets
+            reader.read().map(Offsets::getOffsets).ifPresent(offsets -> offsets.forEach((partition, offset) -> {
+                if (offset != null) {
+                    LOGGER.debug("Committing flushed offset position '{}'", offset);
+                    // A CONFIRM that cannot be sent is handed to the error handler by the coordinator, which
+                    // restarts the task when the failure is retriable
+                    current.commitOffset(partition.getSourcePartition(), offset.getOffset());
+                }
+            }));
         }
         finally {
             commitLock.unlock();
