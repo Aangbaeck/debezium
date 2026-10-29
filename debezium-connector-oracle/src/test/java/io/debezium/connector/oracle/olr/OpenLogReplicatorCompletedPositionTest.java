@@ -104,6 +104,7 @@ public class OpenLogReplicatorCompletedPositionTest {
                 .incrementalSnapshotContext(new SignalBasedIncrementalSnapshotContext<>())
                 .build();
         source.init(offsetContext);
+        source.onStreamStarted(false);
     }
 
     @Test
@@ -186,28 +187,91 @@ public class OpenLogReplicatorCompletedPositionTest {
     void shouldStoreAndLoadCompletedPosition() {
         offsetContext.setScn(Scn.valueOf(100));
         offsetContext.setScnIndex(3L);
-        offsetContext.setCompletedPosition(Scn.valueOf(120), 2L);
+        offsetContext.setCompletedPosition(Scn.valueOf(120), 2L, 77L);
         final Map<String, Object> offset = new HashMap<>(offsetContext.getOffset());
         assertThat(offset).containsEntry(OracleOffsetContext.OLR_COMPLETED_SCN_KEY, "120")
-                .containsEntry(OracleOffsetContext.OLR_COMPLETED_SCN_INDEX_KEY, 2L);
+                .containsEntry(OracleOffsetContext.OLR_COMPLETED_SCN_INDEX_KEY, 2L)
+                .containsEntry(OracleOffsetContext.OLR_COMPLETED_BASE_SCN_KEY, "100")
+                .containsEntry(OracleOffsetContext.OLR_COMPLETED_EPOCH_KEY, 77L);
 
-        final OracleOffsetContext loaded = new OpenLogReplicatorOracleOffsetContextLoader(connectorConfig).load(offset);
+        final OracleOffsetContext loaded = load(offset);
         assertThat(loaded.getCompletedScn()).isEqualTo(Scn.valueOf(120));
         assertThat(loaded.getCompletedScnIndex()).isEqualTo(2L);
+        assertThat(loaded.getCompletedBaseScn()).isEqualTo(Scn.valueOf(100));
+        assertThat(loaded.getCompletedEpoch()).isEqualTo(77L);
 
         // JSON offsets may come back with an int
         final Map<String, Object> narrowed = new HashMap<>(offset);
         narrowed.put(OracleOffsetContext.OLR_COMPLETED_SCN_INDEX_KEY, 2);
-        assertThat(new OpenLogReplicatorOracleOffsetContextLoader(connectorConfig).load(narrowed).getCompletedScnIndex()).isEqualTo(2L);
+        assertThat(load(narrowed).getCompletedScnIndex()).isEqualTo(2L);
+
+        // the offset SCN moved on after the position was set
+        final Map<String, Object> later = new HashMap<>(offset);
+        later.put("scn", "130");
+        assertThat(load(later).getCompletedScn()).isEqualTo(Scn.valueOf(120));
 
         // an offset written before the position existed, or by another adapter
         final Map<String, Object> legacy = new HashMap<>(offset);
         legacy.remove(OracleOffsetContext.OLR_COMPLETED_SCN_KEY);
         legacy.remove(OracleOffsetContext.OLR_COMPLETED_SCN_INDEX_KEY);
-        final OracleOffsetContext legacyLoaded = new OpenLogReplicatorOracleOffsetContextLoader(connectorConfig).load(legacy);
+        final OracleOffsetContext legacyLoaded = load(legacy);
         assertThat(legacyLoaded.getCompletedScn()).isNull();
         assertThat(legacyLoaded.getOffset()).doesNotContainKeys(OracleOffsetContext.OLR_COMPLETED_SCN_KEY,
-                OracleOffsetContext.OLR_COMPLETED_SCN_INDEX_KEY);
+                OracleOffsetContext.OLR_COMPLETED_SCN_INDEX_KEY, OracleOffsetContext.OLR_COMPLETED_BASE_SCN_KEY,
+                OracleOffsetContext.OLR_COMPLETED_EPOCH_KEY);
+    }
+
+    @Test
+    void shouldDropCompletedPositionOfRewoundOffset() {
+        offsetContext.setScn(Scn.valueOf(100));
+        offsetContext.setCompletedPosition(Scn.valueOf(120), 2L, 77L);
+        final Map<String, Object> offset = new HashMap<>(offsetContext.getOffset());
+
+        // an operator set the offset SCN back and left the completed position in place
+        final Map<String, Object> rewound = new HashMap<>(offset);
+        rewound.put("scn", "60");
+        assertThat(load(rewound).getCompletedScn()).isNull();
+        assertThat(load(rewound).getOffset()).doesNotContainKey(OracleOffsetContext.OLR_COMPLETED_SCN_KEY);
+
+        // without a base SCN the position cannot be checked
+        final Map<String, Object> noBase = new HashMap<>(offset);
+        noBase.remove(OracleOffsetContext.OLR_COMPLETED_BASE_SCN_KEY);
+        assertThat(load(noBase).getCompletedScn()).isNull();
+    }
+
+    @Test
+    void shouldIgnoreCompletedPositionOfEarlierStreamAfterStart() throws Exception {
+        // a completed position from before a restart, loaded with the offset
+        offsetContext.setScn(Scn.valueOf(100));
+        offsetContext.setCompletedPosition(Scn.valueOf(120), 2L, 77L);
+        final Map<String, Object> stale = new HashMap<>(offsetContext.getOffset());
+
+        // the server was started again: it numbers the stream anew
+        source.onStreamStarted(false);
+        assertThat(offsetContext.getCompletedScn()).isNull();
+        assertPosition(source.confirmPosition(stale), 100, 0);
+
+        read(begin(100, 1, XID));
+        read(commit(100, 2, XID));
+        assertCompleted(100, 2);
+        assertPosition(source.confirmPosition(new HashMap<>(offsetContext.getOffset())), 100, 2);
+        // the stale offset still does not count once the new stream completed a position
+        assertPosition(source.confirmPosition(stale), 100, 0);
+    }
+
+    @Test
+    void shouldKeepCompletedPositionWhenContinuing() throws Exception {
+        offsetContext.setScn(Scn.valueOf(100));
+        offsetContext.setCompletedPosition(Scn.valueOf(120), 2L, 77L);
+        final Map<String, Object> offset = new HashMap<>(offsetContext.getOffset());
+
+        source.init(load(offset));
+        source.onStreamStarted(true);
+        assertPosition(source.confirmPosition(offset), 120, 2);
+    }
+
+    private OracleOffsetContext load(Map<String, Object> offset) {
+        return new OpenLogReplicatorOracleOffsetContextLoader(connectorConfig).load(offset);
     }
 
     private void assertCompleted(long scn, long index) {

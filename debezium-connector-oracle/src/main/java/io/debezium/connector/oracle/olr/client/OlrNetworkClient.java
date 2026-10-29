@@ -99,6 +99,7 @@ public class OlrNetworkClient {
     private volatile boolean disconnected;
     private long confirmedScn = -1;
     private long confirmedIndex;
+    private boolean continued;
 
     /**
      * Create the OpenLogReplicator network client.
@@ -291,6 +292,15 @@ public class OlrNetworkClient {
         return event;
     }
 
+    /**
+     * Returns whether the server was already streaming and was asked to continue, rather than to start.
+     *
+     * @return {@code true} after a CONTINUE, {@code false} after a START or before connecting
+     */
+    public boolean isContinued() {
+        return continued;
+    }
+
     public void confirm(Scn scn, Long index) {
         confirm(scn.longValue(), index);
     }
@@ -352,12 +362,7 @@ public class OlrNetworkClient {
     private boolean startFrom(Scn scn, Scn continueScn, Long index) {
         // No client-side filter by SCN: OpenLogReplicator sends a transaction on START only when it commits after the
         // start SCN, and on CONTINUE only after (c_scn, c_idx). A transaction open at the start SCN carries rows below it.
-        if (index != null) {
-            LOGGER.info("Streaming will start at SCN {} with index {}.", scn, index);
-        }
-        else {
-            LOGGER.info("Streaming will start at SCN {}.", scn);
-        }
+        LOGGER.info("Streaming will start at SCN {}, or continue after SCN {} index {}.", scn, continueScn, index != null ? index : 0);
         send(createRequest(RequestCode.INFO).build());
 
         RedoResponse response = readResponse();
@@ -371,6 +376,7 @@ public class OlrNetworkClient {
             // starting a source, and is ignored when continuing one. Sending it there leaves the
             // server to continue from whatever it last had confirmed instead, which is as far back
             // as it still holds, so it streams changes that were emitted long ago.
+            continued = true;
             send(createRequest(RequestCode.CONTINUE)
                     .setCScn(continueScn.longValue())
                     .setCIdx(index != null ? index : 0)

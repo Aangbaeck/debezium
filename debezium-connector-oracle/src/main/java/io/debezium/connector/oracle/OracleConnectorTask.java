@@ -278,6 +278,10 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
 
     @Override
     public void performCommit() {
+        if (ConnectorAdapter.OLR.equals(connectorAdapter)) {
+            commitFlushedOffsets();
+            return;
+        }
         if (!ConnectorAdapter.XSTREAM.equals(connectorAdapter)) {
             super.performCommit();
             return;
@@ -302,6 +306,39 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
                             LOGGER.debug("Committing LCR offset position '{}'", maxOffset);
                             coordinator.commitOffset(maxPartition, maxOffset);
                         });
+            }
+        }
+        finally {
+            commitLock.unlock();
+        }
+    }
+
+    /**
+     * Hands the offset Kafka Connect has flushed to OpenLogReplicator's streaming source, which
+     * confirms it to the server. The offset of the last record Kafka acknowledged is not used: Connect
+     * flushes only offsets whose earlier records were all written, but acknowledgements on different
+     * topics arrive in any order, so the last one can be ahead of records that may still fail.
+     */
+    private void commitFlushedOffsets() {
+        final boolean locked = commitLock.tryLock();
+        if (!locked) {
+            LOGGER.warn("Couldn't commit processed log positions with the source database due to a concurrent connector shutdown or restart");
+            return;
+        }
+
+        try {
+            final ChangeEventSourceCoordinator<OraclePartition, OracleOffsetContext> current = coordinator;
+            if (current == null) {
+                return;
+            }
+            final Offsets<OraclePartition, OracleOffsetContext> offsets = getPreviousOffsets(partitionProvider, offsetContextLoader);
+            if (offsets.getOffsets() != null) {
+                offsets.getOffsets().forEach((partition, offset) -> {
+                    if (offset != null) {
+                        LOGGER.debug("Committing flushed offset position '{}'", offset);
+                        current.commitOffset(partition.getSourcePartition(), offset.getOffset());
+                    }
+                });
             }
         }
         finally {
