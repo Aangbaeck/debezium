@@ -341,6 +341,10 @@ public class OracleConnectorTask extends BaseSourceTask<OraclePartition, OracleO
                 });
             }
         }
+        catch (RuntimeException e) {
+            // A skipped CONFIRM only delays releasing data, the next commit confirms again
+            LOGGER.warn("Couldn't confirm the flushed offset with OpenLogReplicator, retrying at the next commit", e);
+        }
         finally {
             commitLock.unlock();
         }
