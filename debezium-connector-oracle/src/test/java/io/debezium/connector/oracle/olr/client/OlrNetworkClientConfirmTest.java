@@ -45,9 +45,15 @@ public class OlrNetworkClientConfirmTest {
             olr.setDaemon(true);
             olr.start();
 
-            final OlrNetworkClient client = new OlrNetworkClient(config(server));
+            final List<StreamPosition> reported = new CopyOnWriteArrayList<>();
+            final OlrNetworkClient client = new OlrNetworkClient(config(server, true));
             try {
-                assertThat(client.connect(Scn.valueOf(100), Scn.valueOf(120), 3L)).isTrue();
+                assertThat(client.connectContinuingAfter(Scn.valueOf(100), confirmed -> {
+                    reported.add(confirmed);
+                    return new StreamPosition(Scn.valueOf(120), 3L);
+                })).isTrue();
+                assertThat(reported).containsExactly(new StreamPosition(Scn.valueOf(90), 2L));
+                assertThat(client.getContinuedAfter()).isEqualTo(new StreamPosition(Scn.valueOf(120), 3L));
                 client.confirm(Scn.valueOf(120), 3L);
                 client.confirm(Scn.valueOf(120), 5L);
                 client.confirm(Scn.valueOf(120), 5L);
@@ -79,11 +85,13 @@ public class OlrNetworkClientConfirmTest {
             olr.setDaemon(true);
             olr.start();
 
-            final OlrNetworkClient client = new OlrNetworkClient(config(server));
+            final OlrNetworkClient client = new OlrNetworkClient(config(server, true));
             try {
-                assertThat(client.connect(Scn.valueOf(100), Scn.valueOf(120), 3L)).isTrue();
+                assertThat(client.connectContinuingAfter(Scn.valueOf(100), confirmed -> new StreamPosition(Scn.valueOf(120), 3L))).isTrue();
                 assertThat(requests.get(1).getCode()).isEqualTo(RequestCode.START);
                 assertThat(requests.get(1).getScn()).isEqualTo(100L);
+                assertThat(client.isContinued()).isFalse();
+                assertThat(client.getContinuedAfter()).isNull();
             }
             finally {
                 client.disconnect();
@@ -91,11 +99,47 @@ public class OlrNetworkClientConfirmTest {
         }
     }
 
-    private static OracleConnectorConfig config(ServerSocket server) {
+    @Test
+    public void shouldContinueAtScnAndConfirmAsBeforeWhenCompletedTransactionsAreNotConfirmed() throws Exception {
+        final List<RedoRequest> requests = new CopyOnWriteArrayList<>();
+        try (ServerSocket server = new ServerSocket(0)) {
+            final Thread olr = new Thread(() -> serve(server, ResponseCode.REPLICATE, requests));
+            olr.setDaemon(true);
+            olr.start();
+
+            final OlrNetworkClient client = new OlrNetworkClient(config(server, false));
+            try {
+                assertThat(client.connect(Scn.valueOf(100), 0L)).isTrue();
+                // the first is never sent, then any SCN above the previous one, sent or not
+                client.confirm(Scn.valueOf(110), 0L);
+                client.confirm(Scn.valueOf(110), 4L);
+                client.confirm(Scn.valueOf(120), 0L);
+                client.confirm(Scn.valueOf(115), 0L);
+                client.confirm(Scn.valueOf(118), 0L);
+                client.confirm(Scn.valueOf(130), 0L);
+
+                Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> requests.size() >= 5);
+                Thread.sleep(200);
+
+                assertThat(requests.get(1).getCode()).isEqualTo(RequestCode.CONTINUE);
+                assertThat(requests.get(1).getCScn()).isEqualTo(100L);
+                assertThat(requests.get(1).getCIdx()).isEqualTo(0L);
+                assertThat(requests.subList(2, requests.size()))
+                        .extracting(r -> r.getCode() + " " + r.getCScn() + " " + r.getCIdx())
+                        .containsExactly("CONFIRM 120 0", "CONFIRM 118 0", "CONFIRM 130 0");
+            }
+            finally {
+                client.disconnect();
+            }
+        }
+    }
+
+    private static OracleConnectorConfig config(ServerSocket server, boolean confirmCompletedTransactions) {
         return new OracleConnectorConfig(TestHelper.defaultConfig()
                 .with(OracleConnectorConfig.OLR_HOST, "127.0.0.1")
                 .with(OracleConnectorConfig.OLR_PORT, server.getLocalPort())
                 .with(OracleConnectorConfig.OLR_SOURCE, "S1")
+                .with(OracleConnectorConfig.OLR_CONFIRM_COMPLETED_TRANSACTIONS, confirmCompletedTransactions)
                 .build());
     }
 
@@ -104,7 +148,7 @@ public class OlrNetworkClientConfirmTest {
             final DataInputStream in = new DataInputStream(socket.getInputStream());
             final OutputStream out = socket.getOutputStream();
             requests.add(readRequest(in));
-            write(out, RedoResponse.newBuilder().setCode(infoResponse).build().toByteArray());
+            write(out, RedoResponse.newBuilder().setCode(infoResponse).setScn(80).setCScn(90).setCIdx(2).build().toByteArray());
             requests.add(readRequest(in));
             write(out, RedoResponse.newBuilder().setCode(ResponseCode.REPLICATE).build().toByteArray());
             while (true) {

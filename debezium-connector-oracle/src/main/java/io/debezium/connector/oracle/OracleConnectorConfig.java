@@ -669,6 +669,18 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     + "the connection to OpenLogReplicator; the connector then restarts and reconnects. With the defaults a dead "
                     + "connection fails about 120 seconds after its last traffic. Defaults to 6.");
 
+    public static final Field OLR_CONFIRM_COMPLETED_TRANSACTIONS = Field.create("openlogreplicator.confirm.completed.transactions")
+            .withDisplayName("Confirm and continue past completed transactions with OpenLogReplicator")
+            .withType(Type.BOOLEAN)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.LOW)
+            .withDefault(false)
+            .withDescription("Whether the connector confirms to OpenLogReplicator, and continues after, the position of the last "
+                    + "transaction it emitted completely and of checkpoints read outside a transaction, rather than the start of "
+                    + "the offset SCN. This lets OpenLogReplicator release its queue while the captured tables are quiet. "
+                    + "Requires an OpenLogReplicator that stamps messages with the commit SCN and sends exact c_idx values, such as "
+                    + "the ahlsell-group fork; with OpenLogReplicator 2.0.0 it loses changes. Defaults to false.");
+
     public static final Field LOG_MINING_SCHEMA_CHANGES_USERNAME_EXCLUDE_LIST = Field.createInternal("log.mining.schema_changes.username.exclude.list")
             .withDisplayName("Username exclusion list for schema changes")
             .withType(Type.STRING)
@@ -888,7 +900,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     LOG_MINING_LOG_BACKOFF_MAX_DELAY_MS, LOG_MINING_SESSION_MAX_MS, LOG_MINING_WINDOW_MAX_MS, LOG_MINING_TRANSACTION_SNAPSHOT_BOUNDARY_MODE,
                     LOG_MINING_READ_ONLY, LOG_MINING_FLUSH_TABLE_NAME, LOG_MINING_QUERY_FILTER_MODE, LOG_MINING_RESTART_CONNECTION, LOG_MINING_MAX_SCN_DEVIATION_MS,
                     LOG_MINING_SCHEMA_CHANGES_USERNAME_EXCLUDE_LIST, LOG_MINING_INCLUDE_REDO_SQL, OLR_SOURCE, OLR_HOST, OLR_PORT,
-                    OLR_KEEPALIVE_IDLE_MS, OLR_KEEPALIVE_INTERVAL_MS, OLR_KEEPALIVE_COUNT,
+                    OLR_KEEPALIVE_IDLE_MS, OLR_KEEPALIVE_INTERVAL_MS, OLR_KEEPALIVE_COUNT, OLR_CONFIRM_COMPLETED_TRANSACTIONS,
                     LOG_MINING_BUFFER_EHCACHE_GLOBAL_CONFIG, LOG_MINING_BUFFER_EHCACHE_TRANSACTIONS_CONFIG, LOG_MINING_BUFFER_EHCACHE_PROCESSED_TRANSACTIONS_CONFIG,
                     LOG_MINING_BUFFER_EHCACHE_SCHEMA_CHANGES_CONFIG, LOG_MINING_BUFFER_EHCACHE_EVENTS_CONFIG,
                     LOG_MINING_SQL_RELAXED_QUOTE_DETECTION, LOG_MINING_CLIENTID_INCLUDE_LIST, LOG_MINING_CLIENTID_EXCLUDE_LIST, LOG_MINING_RESUME_POSITION_INTERVAL_MS,
@@ -989,6 +1001,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     private final Duration openLogReplicatorKeepAliveIdle;
     private final Duration openLogReplicatorKeepAliveInterval;
     private final int openLogReplicatorKeepAliveCount;
+    private final boolean openLogReplicatorConfirmCompletedTransactions;
 
     private final Duration resumePositionUpdateInterval;
 
@@ -1093,6 +1106,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
         this.openLogReplicatorKeepAliveIdle = Duration.ofMillis(config.getLong(OLR_KEEPALIVE_IDLE_MS));
         this.openLogReplicatorKeepAliveInterval = Duration.ofMillis(config.getLong(OLR_KEEPALIVE_INTERVAL_MS));
         this.openLogReplicatorKeepAliveCount = config.getInteger(OLR_KEEPALIVE_COUNT);
+        this.openLogReplicatorConfirmCompletedTransactions = config.getBoolean(OLR_CONFIRM_COMPLETED_TRANSACTIONS);
 
         this.resumePositionUpdateInterval = Duration.ofMillis(config.getLong(LOG_MINING_RESUME_POSITION_INTERVAL_MS));
     }
@@ -2159,6 +2173,16 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
      */
     public int getOpenLogReplicatorKeepAliveCount() {
         return openLogReplicatorKeepAliveCount;
+    }
+
+    /**
+     * Returns whether OpenLogReplicator is confirmed, and continued after, the position of the last
+     * completely emitted transaction rather than the start of the offset SCN.
+     *
+     * @return {@code true} if the completed position is used, {@code false} otherwise
+     */
+    public boolean isOpenLogReplicatorConfirmCompletedTransactions() {
+        return openLogReplicatorConfirmCompletedTransactions;
     }
 
     /**

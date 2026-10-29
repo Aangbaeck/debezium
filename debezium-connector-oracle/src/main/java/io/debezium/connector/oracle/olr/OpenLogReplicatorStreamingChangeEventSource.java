@@ -32,6 +32,7 @@ import io.debezium.connector.oracle.jdbc.OracleConnectionFactory;
 import io.debezium.connector.oracle.olr.client.OlrNetworkClient;
 import io.debezium.connector.oracle.olr.client.PayloadEvent;
 import io.debezium.connector.oracle.olr.client.PayloadEvent.Type;
+import io.debezium.connector.oracle.olr.client.StreamPosition;
 import io.debezium.connector.oracle.olr.client.StreamingEvent;
 import io.debezium.connector.oracle.olr.client.payloads.AbstractMutationEvent;
 import io.debezium.connector.oracle.olr.client.payloads.PayloadSchema;
@@ -71,6 +72,7 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
     private final OpenLogReplicatorStreamingChangeEventSourceMetrics streamingMetrics;
     private final SnapshotterService snapshotterService;
     private final OffsetActivityMonitorService offsetActivityMonitorService;
+    private final boolean confirmCompletedTransactions;
 
     private OlrNetworkClient client;
     private OraclePartition partition;
@@ -83,8 +85,9 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
      */
     private boolean inTransaction = false;
     /**
-     * Identifies the numbering of the stream being read. A START makes the server number the stream
-     * again from the start SCN, so a completed position from before it does not apply to it.
+     * Identifies the connection the completed position was reached on. A position from an earlier
+     * connection may belong to a stream the server has numbered again since, after a START, so it
+     * is only confirmed once this connection has vouched for it.
      */
     private volatile Long streamEpoch;
     /**
@@ -112,6 +115,7 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
         this.streamingMetrics = streamingMetrics;
         this.snapshotterService = snapshotterService;
         this.offsetActivityMonitorService = OffsetActivityMonitorService.lookup(connectorConfig.getServiceRegistry());
+        this.confirmCompletedTransactions = connectorConfig.isOpenLogReplicatorConfirmCompletedTransactions();
     }
 
     @Override
@@ -156,24 +160,25 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
             // asking it to resume mid-transaction relies on it cutting the stream in exactly the
             // right place. Replaying the transaction and discarding what was already emitted, the
             // way the LogMiner adapter does, removes that dependency.
+            Long startScnIndex = offsetScnIndex;
             if (offsetScnIndex != null) {
                 replayScn = startScn;
                 replayScnIndex = offsetScnIndex;
                 replayTransactionId = offsetContext.getTransactionId();
+                startScnIndex = 0L;
                 LOGGER.info("Replaying transaction {} at SCN {} from its start, skipping through index {}.",
                         replayTransactionId, replayScn, replayScnIndex);
             }
             inTransaction = false;
 
-            // A server that is already streaming still holds what follows the last position this
-            // connector confirmed, so it continues from there; a server that starts reads redo again
-            // from the offset SCN.
-            final Position continuePosition = Position.resumeFrom(startScn,
-                    offsetContext.getCompletedScn(), offsetContext.getCompletedScnIndex());
-
             final OlrNetworkClient newClient = new OlrNetworkClient(connectorConfig);
-            if (newClient.connect(startScn, continuePosition.scn(), continuePosition.index())) {
-                onStreamStarted(newClient.isContinued());
+            final boolean connected = confirmCompletedTransactions
+                    ? newClient.connectContinuingAfter(startScn, confirmed -> continuePosition(startScn, confirmed))
+                    : newClient.connect(startScn, startScnIndex);
+            if (connected) {
+                if (confirmCompletedTransactions) {
+                    onStreamStarted(startScn, newClient.getContinuedAfter());
+                }
                 this.client = newClient;
                 try {
                     // Start read loop
@@ -218,19 +223,45 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
     }
 
     /**
-     * Sets the stream numbering for a new connection. Continuing keeps the numbering the offset's
-     * completed position belongs to; a START drops the completed position until the new stream
-     * completes one of its own.
+     * The position a server that is already streaming continues after: the offset's completed
+     * position, but no further than the position the server reports confirmed, and not before the
+     * start of the offset SCN.
+     *
+     * <p>The stored completed position may come from before a START, which numbers the stream anew,
+     * when no record was flushed after it. What the server reports confirmed belongs to its current
+     * run and was confirmed from flushed offsets, so everything up to it has been delivered.
+     *
+     * @param startScn the offset SCN, never {@code null}
+     * @param serverConfirmed the position the server reports confirmed, {@code null} if none
      */
-    void onStreamStarted(boolean continued) {
-        if (continued && offsetContext.getCompletedScn() != null && offsetContext.getCompletedEpoch() != null) {
-            streamEpoch = offsetContext.getCompletedEpoch();
+    StreamPosition continuePosition(Scn startScn, StreamPosition serverConfirmed) {
+        final StreamPosition start = new StreamPosition(startScn, 0L);
+        if (serverConfirmed == null) {
+            return start;
+        }
+        final StreamPosition completed = StreamPosition.resumeFrom(startScn,
+                offsetContext.getCompletedScn(), offsetContext.getCompletedScnIndex());
+        final StreamPosition position = StreamPosition.min(completed, serverConfirmed);
+        return position.isAfter(start) ? position : start;
+    }
+
+    /**
+     * Starts a new connection epoch. After a CONTINUE the completed position becomes the position the
+     * server continues after; after a START it is dropped until the new stream completes one.
+     * Positions stored by earlier connections carry another epoch and are confirmed as the start of
+     * their offset SCN.
+     *
+     * @param startScn the offset SCN, never {@code null}
+     * @param continuedAfter the position the server continues after, {@code null} after a START
+     */
+    void onStreamStarted(Scn startScn, StreamPosition continuedAfter) {
+        streamEpoch = ThreadLocalRandom.current().nextLong();
+        final StreamPosition start = new StreamPosition(startScn, 0L);
+        if (continuedAfter != null && continuedAfter.isAfter(start)) {
+            offsetContext.setCompletedPosition(continuedAfter.scn(), continuedAfter.index(), streamEpoch);
         }
         else {
-            if (!continued) {
-                offsetContext.clearCompletedPosition();
-            }
-            streamEpoch = ThreadLocalRandom.current().nextLong();
+            offsetContext.clearCompletedPosition();
         }
     }
 
@@ -262,9 +293,10 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
      * after a restart; a server that starts again reads redo from the offset SCN, and the replay skips
      * the completed transaction by its identifier and index.
      *
-     * <p>This relies on OpenLogReplicator stamping messages in commit order (c_scn never decreases
-     * along the stream), so that no message sent after a commit or a checkpoint carries a lower
-     * position.
+     * <p>The completed position is used only with {@code openlogreplicator.confirm.completed.transactions}.
+     * It relies on OpenLogReplicator stamping messages in commit order (c_scn never decreases along
+     * the stream) and sending exact c_idx values, so that no message sent after a commit or a
+     * checkpoint carries a lower position.
      *
      * @param offset the offset that has been committed, never {@code null}
      */
@@ -279,7 +311,7 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
             return;
         }
 
-        final Position position = confirmPosition(offset);
+        final StreamPosition position = confirmPosition(offset);
         client.confirm(position.scn(), position.index());
     }
 
@@ -287,44 +319,16 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
      * The position to confirm for a committed offset: its completed position when that belongs to the
      * stream being read and is past the start of the offset SCN, otherwise the start of the offset SCN.
      */
-    Position confirmPosition(Map<String, ?> offset) {
+    StreamPosition confirmPosition(Map<String, ?> offset) {
         final Scn scn = OracleOffsetContext.getScnFromOffsetMapByKey(offset, SourceInfo.SCN_KEY);
         final Object epoch = offset.get(OracleOffsetContext.OLR_COMPLETED_EPOCH_KEY);
-        if (streamEpoch == null || !(epoch instanceof Number number) || number.longValue() != streamEpoch) {
-            return new Position(scn, 0L);
+        if (!confirmCompletedTransactions || streamEpoch == null || !(epoch instanceof Number number) || number.longValue() != streamEpoch) {
+            return new StreamPosition(scn, 0L);
         }
         final Object completedIndex = offset.get(OracleOffsetContext.OLR_COMPLETED_SCN_INDEX_KEY);
-        return Position.resumeFrom(scn,
+        return StreamPosition.resumeFrom(scn,
                 OracleOffsetContext.getScnFromOffsetMapByKey(offset, OracleOffsetContext.OLR_COMPLETED_SCN_KEY),
                 completedIndex instanceof Number index ? index.longValue() : null);
-    }
-
-    /**
-     * A position in the OpenLogReplicator stream, ordered by c_scn and then c_idx.
-     */
-    record Position(Scn scn, long index) {
-
-        /**
-         * The position to confirm and to continue from: the start of the offset SCN, or the completed
-         * position when that is further along.
-         *
-         * @param scn the offset SCN, never {@code null}
-         * @param completedScn the c_scn of the completed position, may be {@code null}
-         * @param completedIndex the c_idx of the completed position, may be {@code null}
-         */
-        static Position resumeFrom(Scn scn, Scn completedScn, Long completedIndex) {
-            final Position start = new Position(scn, 0L);
-            if (completedScn == null || completedScn.isNull()) {
-                return start;
-            }
-            final Position completed = new Position(completedScn, completedIndex != null ? completedIndex : 0L);
-            return completed.isAfter(start) ? completed : start;
-        }
-
-        boolean isAfter(Position other) {
-            final int comparison = scn.compareTo(other.scn);
-            return comparison > 0 || (comparison == 0 && index > other.index);
-        }
     }
 
     /**
@@ -334,14 +338,17 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
      * before this position.
      */
     private void completeThrough(StreamingEvent event) {
+        if (!confirmCompletedTransactions) {
+            return;
+        }
         final Scn scn = event.getCheckpointScn();
         final Long index = event.getCheckpointIndex();
         if (scn == null || scn.isNull() || index == null) {
             return;
         }
-        final Position position = new Position(scn, index);
+        final StreamPosition position = new StreamPosition(scn, index);
         final Scn completedScn = offsetContext.getCompletedScn();
-        if (completedScn == null || position.isAfter(new Position(completedScn, offsetContext.getCompletedScnIndex()))) {
+        if (completedScn == null || position.isAfter(new StreamPosition(completedScn, offsetContext.getCompletedScnIndex()))) {
             offsetContext.setCompletedPosition(scn, index, streamEpoch);
         }
     }

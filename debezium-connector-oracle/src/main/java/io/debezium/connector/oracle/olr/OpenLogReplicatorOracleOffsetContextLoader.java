@@ -41,7 +41,8 @@ public class OpenLogReplicatorOracleOffsetContextLoader implements OffsetContext
                 .snapshotCompleted(loadSnapshotCompleted(offset))
                 .transactionContext(TransactionContext.load(offset))
                 .incrementalSnapshotContext(SignalBasedIncrementalSnapshotContext.load(offset))
-                .completedPosition(completedScn(offset), longValue(offset, OracleOffsetContext.OLR_COMPLETED_SCN_INDEX_KEY),
+                .completedPosition(connectorConfig.isOpenLogReplicatorConfirmCompletedTransactions() ? completedScn(offset) : null,
+                        longValue(offset, OracleOffsetContext.OLR_COMPLETED_SCN_INDEX_KEY),
                         OracleOffsetContext.getScnFromOffsetMapByKey(offset, OracleOffsetContext.OLR_COMPLETED_BASE_SCN_KEY),
                         longValue(offset, OracleOffsetContext.OLR_COMPLETED_EPOCH_KEY))
                 .build();

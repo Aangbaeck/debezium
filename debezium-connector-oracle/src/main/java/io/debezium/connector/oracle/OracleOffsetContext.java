@@ -41,8 +41,8 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
      * OpenLogReplicator only: the stream position (c_scn, c_idx) through which every message belongs to a
      * transaction that was emitted completely, or to a checkpoint. Kept apart from the SCN so that the position a
      * restart reads redo from does not move past a transaction that is still open in the database.
-     * The base SCN is the offset SCN when the position was set, and the epoch identifies the stream
-     * numbering the position belongs to, which a START begins anew.
+     * The base SCN is the offset SCN when the position was set, and the epoch identifies the connection
+     * to OpenLogReplicator the position was reached on.
      */
     private Scn completedScn;
     private Long completedScnIndex;

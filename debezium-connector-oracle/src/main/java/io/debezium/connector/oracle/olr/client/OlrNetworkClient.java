@@ -19,6 +19,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -97,9 +98,12 @@ public class OlrNetworkClient {
     private Selector selector;
     private ByteBuffer payloadBuffer;
     private volatile boolean disconnected;
+    private final boolean confirmCompletedTransactions;
+    private long prevScn;
     private long confirmedScn = -1;
     private long confirmedIndex;
     private boolean continued;
+    private StreamPosition continuedAfter;
 
     /**
      * Create the OpenLogReplicator network client.
@@ -113,6 +117,7 @@ public class OlrNetworkClient {
         this.keepAliveIdle = connectorConfig.getOpenLogReplicatorKeepAliveIdle();
         this.keepAliveInterval = connectorConfig.getOpenLogReplicatorKeepAliveInterval();
         this.keepAliveCount = connectorConfig.getOpenLogReplicatorKeepAliveCount();
+        this.confirmCompletedTransactions = connectorConfig.isOpenLogReplicatorConfirmCompletedTransactions();
     }
 
     /**
@@ -123,18 +128,18 @@ public class OlrNetworkClient {
      * @return true if the connection was established, false if the connection failed
      */
     public boolean connect(Scn scn, Long index) {
-        return connect(scn, scn, index);
+        return connectContinuingAfter(scn, confirmed -> new StreamPosition(scn, index != null ? index : 0L));
     }
 
     /**
      * Connect to the OpenLogReplicator process.
      *
      * @param scn the system change number a server that has not started yet begins reading redo at
-     * @param continueScn the c_scn a server that is already streaming continues after
-     * @param continueIndex the c_idx a server that is already streaming continues after
+     * @param continueAfter given the position a server that is already streaming reports as confirmed, or
+     *            {@code null} when it reports none, returns the position to continue after
      * @return true if the connection was established, false if the connection failed
      */
-    public boolean connect(Scn scn, Scn continueScn, Long continueIndex) {
+    public boolean connectContinuingAfter(Scn scn, UnaryOperator<StreamPosition> continueAfter) {
         if (scn == null || scn.isNull()) {
             throw new OlrNetworkClientException("Cannot connect and start with a null system change number");
         }
@@ -148,7 +153,7 @@ public class OlrNetworkClient {
                 return false;
             }
 
-            if (!startFrom(scn, continueScn, continueIndex)) {
+            if (!startFrom(scn, continueAfter)) {
                 return false;
             }
 
@@ -301,6 +306,15 @@ public class OlrNetworkClient {
         return continued;
     }
 
+    /**
+     * Returns the position the server was asked to continue after.
+     *
+     * @return the position after a CONTINUE, {@code null} after a START or before connecting
+     */
+    public StreamPosition getContinuedAfter() {
+        return continuedAfter;
+    }
+
     public void confirm(Scn scn, Long index) {
         confirm(scn.longValue(), index);
     }
@@ -345,9 +359,18 @@ public class OlrNetworkClient {
 
     /**
      * Sends a CONFIRM for the position unless an equal or later one was already confirmed on this
-     * connection, so the confirmed position only moves forward.
+     * connection, so the confirmed position only moves forward. Without completed transactions
+     * confirmed, only a higher SCN is sent, and never the first on a connection.
      */
     private void confirm(long newScn, Long index) {
+        if (!confirmCompletedTransactions) {
+            if (prevScn != 0 && prevScn < newScn && index != null) {
+                LOGGER.debug("Confirming SCN {} with index {}", newScn, index);
+                send(createRequest(RequestCode.CONFIRM).setCScn(newScn).setCIdx(index).build());
+            }
+            prevScn = newScn;
+            return;
+        }
         if (index == null) {
             return;
         }
@@ -359,10 +382,10 @@ public class OlrNetworkClient {
         }
     }
 
-    private boolean startFrom(Scn scn, Scn continueScn, Long index) {
+    private boolean startFrom(Scn scn, UnaryOperator<StreamPosition> continueAfter) {
         // No client-side filter by SCN: OpenLogReplicator sends a transaction on START only when it commits after the
         // start SCN, and on CONTINUE only after (c_scn, c_idx). A transaction open at the start SCN carries rows below it.
-        LOGGER.info("Streaming will start at SCN {}, or continue after SCN {} index {}.", scn, continueScn, index != null ? index : 0);
+        LOGGER.info("Streaming will start at SCN {}.", scn);
         send(createRequest(RequestCode.INFO).build());
 
         RedoResponse response = readResponse();
@@ -370,16 +393,21 @@ public class OlrNetworkClient {
             return false;
         }
         else if (response.getCode() == ResponseCode.REPLICATE) {
-            LOGGER.info("OpenLogReplicator has already started, continue from SCN {} index {}", continueScn, index != null ? index : 0);
+            // The server reports the position confirmed in its current run; none is all ones, or 0 when unset
+            final StreamPosition confirmed = response.getCScn() > 0 ? new StreamPosition(Scn.valueOf(response.getCScn()), response.getCIdx()) : null;
+            final StreamPosition position = continueAfter.apply(confirmed);
+            LOGGER.info("OpenLogReplicator has already started, continue from SCN {} index {} (server confirmed {})",
+                    position.scn(), position.index(), confirmed != null ? confirmed.scn() + " index " + confirmed.index() : "nothing");
             // The position a source is continued from is carried by c_scn and c_idx. The system
             // change number on its own says where to begin reading redo, which only applies to
             // starting a source, and is ignored when continuing one. Sending it there leaves the
             // server to continue from whatever it last had confirmed instead, which is as far back
             // as it still holds, so it streams changes that were emitted long ago.
             continued = true;
+            continuedAfter = position;
             send(createRequest(RequestCode.CONTINUE)
-                    .setCScn(continueScn.longValue())
-                    .setCIdx(index != null ? index : 0)
+                    .setCScn(position.scn().longValue())
+                    .setCIdx(position.index())
                     .build());
         }
         else if (response.getCode() == ResponseCode.READY) {

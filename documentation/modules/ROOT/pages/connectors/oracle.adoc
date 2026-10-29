@@ -6248,6 +6248,16 @@ The connection then fails with a retriable error and the connector reconnects.
 With the defaults, a dead connection fails about 2 minutes after its last traffic.
 While the connector has sent data that the server has not acknowledged, for example a confirmation sent just after the server went away, the operating system sends no probes and its retransmission timeout applies instead, about 15 minutes on Linux by default.
 
+|[[oracle-property-openlogreplicator-confirm-completed-transactions]]<<oracle-property-openlogreplicator-confirm-completed-transactions, `+openlogreplicator.confirm.completed.transactions+`>>
+|`false`
+|Whether the connector confirms to OpenLogReplicator the position of the last transaction it emitted completely, and of checkpoints it read outside a transaction, and continues after that position when it reconnects to a running OpenLogReplicator.
+When `false`, the connector confirms and continues from the start of the SCN in its offset, so OpenLogReplicator keeps the messages at and after that SCN until a captured change moves the offset; while the captured tables are quiet, its queue can fill up.
+The position is stored in the offset as `olr_c_scn`, `olr_c_idx`, `olr_c_base_scn` and `olr_c_epoch`.
+It reaches Kafka only with a record, so enable heartbeats (`heartbeat.interval.ms`) or transaction metadata for it to take effect.
+
+WARNING: Enable this only with an OpenLogReplicator that stamps every message with its transaction's commit SCN, so that positions never decrease along the stream, and that sends the exact `c_idx` of each message, for example the `ahlsell-group/OpenLogReplicator` fork.
+OpenLogReplicator 2.0.0 stamps messages with the transaction's begin SCN and sends `c_idx` one higher than it compares on CONTINUE and CONFIRM, so with this option enabled the connector loses changes.
+
 |===
 
 [[oracle-openlogreplicator-row-id-support]]
