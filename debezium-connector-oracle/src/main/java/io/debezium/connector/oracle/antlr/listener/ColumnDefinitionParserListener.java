@@ -280,6 +280,20 @@ public class ColumnDefinitionParserListener extends BaseParserListener {
                         .jdbcType(Types.NCLOB)
                         .type("NCLOB");
             }
+            // LONG and LONG RAW as read over JDBC: the dictionary's data length is 0
+            else if (ctx.native_datatype_element().LONG() != null) {
+                if (ctx.native_datatype_element().RAW() != null) {
+                    columnEditor
+                            .jdbcType(Types.LONGVARBINARY)
+                            .type("LONG RAW");
+                }
+                else {
+                    columnEditor
+                            .jdbcType(Types.LONGVARCHAR)
+                            .type("LONG");
+                }
+                columnEditor.length(0);
+            }
             else if (ctx.native_datatype_element().RAW() != null) {
                 columnEditor
                         .jdbcType(OracleTypes.RAW)

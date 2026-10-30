@@ -637,6 +637,48 @@ public class OracleDdlParserTest {
         assertThat(column.typeName()).isNull();
     }
 
+    @Test
+    void shouldParseLongRawColumn() {
+        final Table table = parseTable("\"ID\" NUMBER(10,0), \"LR\" LONG RAW");
+        // as ojdbc reports it: LONGVARBINARY, column size 0
+        testColumn(table, "LR", true, Types.LONGVARBINARY, "LONG RAW", 0, null, true, null);
+        assertThat(table.columnWithName("LR").scale()).isEmpty();
+    }
+
+    @Test
+    void shouldParseLongColumn() {
+        final Table table = parseTable("\"ID\" NUMBER(10,0), \"L\" LONG NOT NULL");
+        // as ojdbc reports it: LONGVARCHAR, column size 0
+        testColumn(table, "L", false, Types.LONGVARCHAR, "LONG", 0, null, false, null);
+        assertThat(table.columnWithName("L").scale()).isEmpty();
+    }
+
+    @Test
+    void shouldParseRawColumn() {
+        final Table table = parseTable("\"ID\" NUMBER(10,0), \"R\" RAW(16)");
+        testColumn(table, "R", true, OracleTypes.RAW, "RAW", 16, null, true, null);
+    }
+
+    @Test
+    void shouldParseLongLongRawAndRawColumnsInOneTable() {
+        // Oracle allows one LONG or LONG RAW column per table; the parser does not check that
+        final Table table = parseTable("\"ID\" NUMBER(10,0), \"L\" LONG, \"R\" RAW(16), \"LR\" LONG RAW");
+        assertThat(table.retrieveColumnNames()).containsExactly("ID", "L", "R", "LR");
+        testColumn(table, "L", true, Types.LONGVARCHAR, "LONG", 0, null, true, null);
+        testColumn(table, "R", true, OracleTypes.RAW, "RAW", 16, null, true, null);
+        testColumn(table, "LR", true, Types.LONGVARBINARY, "LONG RAW", 0, null, true, null);
+
+        parser.parse("ALTER TABLE \"DEBEZIUM\".\"" + TABLE_NAME + "\" MODIFY (\"R\" LONG RAW)", tables);
+        testColumn(tables.forTable(new TableId(PDB_NAME, "DEBEZIUM", TABLE_NAME)), "R", true, Types.LONGVARBINARY, "LONG RAW", 0, null, true, null);
+    }
+
+    private Table parseTable(String columns) {
+        parser.setCurrentDatabase(PDB_NAME);
+        parser.setCurrentSchema("DEBEZIUM");
+        parser.parse("CREATE TABLE \"DEBEZIUM\".\"" + TABLE_NAME + "\" (" + columns + ");", tables);
+        return tables.forTable(new TableId(PDB_NAME, "DEBEZIUM", TABLE_NAME));
+    }
+
     private List<DdlParserListener.EventType> getEventTypesFromChanges(DdlChanges changes) {
         List<DdlParserListener.EventType> eventTypes = new ArrayList<>();
         changes.getEventsByDatabase((String dbName, List<DdlParserListener.Event> events) -> {
