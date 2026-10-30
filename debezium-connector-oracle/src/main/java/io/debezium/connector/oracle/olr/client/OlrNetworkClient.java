@@ -35,6 +35,7 @@ import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import io.debezium.DebeziumException;
 import io.debezium.annotation.VisibleForTesting;
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.Scn;
@@ -394,6 +395,7 @@ public class OlrNetworkClient {
         LOGGER.info("Streaming will start at SCN {}.", scn);
         send(createRequest(RequestCode.INFO).build());
 
+        final String requested;
         RedoResponse response = readInfoResponse();
         if (response == null) {
             return false;
@@ -411,6 +413,7 @@ public class OlrNetworkClient {
             // as it still holds, so it streams changes that were emitted long ago.
             continued = true;
             continuedAfter = position;
+            requested = "CONTINUE after SCN " + position.scn() + " index " + position.index();
             send(createRequest(RequestCode.CONTINUE)
                     .setCScn(position.scn().longValue())
                     .setCIdx(position.index())
@@ -419,6 +422,7 @@ public class OlrNetworkClient {
         else if (response.getCode() == ResponseCode.READY) {
             // todo: add support for continue index (c_idx)??
             LOGGER.info("OpenLogReplicator ready, streaming from SCN {}.", scn);
+            requested = "START at SCN " + scn;
             send(createRequest(RequestCode.START).setScn(scn.longValue()).build());
         }
         else {
@@ -432,8 +436,10 @@ public class OlrNetworkClient {
             return false;
         }
         else if (response.getCode() != ResponseCode.REPLICATE) {
-            LOGGER.warn("Server failed to enter streaming mode, OpenLogReplicator client shutting down.");
-            return false;
+            // Not retriable: the server refuses the same request until it is restarted
+            throw new DebeziumException("OpenLogReplicator answered " + response.getCode() + " to " + requested
+                    + ". If the connector offset was rewound or reset, restart OpenLogReplicator so it starts from the offset, "
+                    + "then restart the task.");
         }
 
         LOGGER.info("OpenLogReplicator streaming client started successfully.");

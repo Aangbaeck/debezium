@@ -6261,7 +6261,8 @@ OpenLogReplicator 2.0.0 stamps messages with the transaction's begin SCN and sen
 Disabling the option after it was enabled is safe but not silent.
 OpenLogReplicator has already released the messages up to the position the connector confirmed, while the connector now continues from the start of the SCN in its offset, which lies before that position.
 OpenLogReplicator logs warning 60039 for the CONTINUE and sends what it still holds; the released messages had already been emitted, so no change is lost.
-With `continue-gap: 1` in its writer configuration, OpenLogReplicator refuses the CONTINUE instead, and the connector task stays `RUNNING` without streaming: restart OpenLogReplicator, then restart the connector task.
+With `continue-gap: 1` in its writer configuration, OpenLogReplicator refuses the CONTINUE instead, and the connector task fails with an error that names the refusal and the requested position: restart OpenLogReplicator, then restart the connector task.
+The task fails the same way whenever OpenLogReplicator answers a START or CONTINUE with anything other than `REPLICATE`, for example after the connector offset was rewound or reset.
 To avoid both, stop the connector, restart OpenLogReplicator, then disable the option and resume the connector: an OpenLogReplicator that restarted while no client was connected has confirmed nothing in its run, so there is nothing to continue before.
 
 |[[oracle-property-openlogreplicator-info-timeout-ms]]<<oracle-property-openlogreplicator-info-timeout-ms, `+openlogreplicator.info.timeout.ms+`>>
