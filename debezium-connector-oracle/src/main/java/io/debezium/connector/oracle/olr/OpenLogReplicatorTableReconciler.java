@@ -8,10 +8,12 @@ package io.debezium.connector.oracle.olr;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 
@@ -38,6 +40,12 @@ final class OpenLogReplicatorTableReconciler {
     /** Byte length of a {@code TIMESTAMP(0)}; every other fractional precision is stored in 11 bytes. */
     private static final int TIMESTAMP_WITHOUT_FRACTION_LENGTH = 7;
     private static final int NUMBER_MAX_PRECISION = 38;
+    /** Most bytes a character takes in any Oracle character set. */
+    private static final int MAX_BYTES_PER_CHARACTER = 4;
+    /** Model types OpenLogReplicator describes with a type of its own; it reports every other type as unknown. */
+    private static final Set<String> TYPES_NAMED_BY_OLR = Set.of("NUMBER", "FLOAT", "VARCHAR2", "NVARCHAR2", "CHAR", "NCHAR", "DATE",
+            "TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "TIMESTAMP WITH LOCAL TIME ZONE", "RAW", "LONG", "LONG RAW", "BINARY_FLOAT",
+            "BINARY_DOUBLE", "CLOB", "NCLOB", "BLOB", "INTERVAL YEAR TO MONTH", "INTERVAL DAY TO SECOND", "UROWID");
 
     /**
      * A column whose type cannot be derived from OpenLogReplicator's metadata without guessing.
@@ -54,6 +62,32 @@ final class OpenLogReplicatorTableReconciler {
      * @param primaryKeyDropped whether the base model's primary key was dropped because a column of it no longer exists
      */
     record Result(Table table, List<String> changes, boolean primaryKeyDropped) {
+    }
+
+    /**
+     * A model's columns by exact name with their normalized type names, built once per model instance so that comparing
+     * a change with the model does no string work.
+     */
+    static final class ModelIndex {
+        private final Table table;
+        private final Map<String, IndexedColumn> columns;
+
+        ModelIndex(Table table) {
+            this.table = table;
+            this.columns = new HashMap<>();
+            table.columns().forEach(column -> columns.put(column.name(), new IndexedColumn(column, normalizedTypeName(column))));
+        }
+
+        Table table() {
+            return table;
+        }
+
+        IndexedColumn column(String name) {
+            return columns.get(name);
+        }
+    }
+
+    record IndexedColumn(Column column, String typeName) {
     }
 
     private OpenLogReplicatorTableReconciler() {
@@ -152,12 +186,19 @@ final class OpenLogReplicatorTableReconciler {
     /**
      * Whether a model column can hold the values of a column OpenLogReplicator describes. Compares what the metadata
      * states exactly: the type family, a {@code NUMBER}'s precision and scale, a {@code RAW}'s length, and whether a
-     * {@code TIMESTAMP} has a fraction. Character lengths are in bytes in the metadata and not compared. An
-     * {@code XMLTYPE} fits a {@code clob} or {@code blob}.
+     * {@code TIMESTAMP} has a fraction. A character length, which the metadata has in bytes, fits if it is the model's
+     * length times 1 to 4 bytes per character, or a byte limit such a length is capped at. An {@code XMLTYPE} fits a
+     * {@code clob} or {@code blob}.
      */
     static boolean isCompatible(Column column, SchemaColumn schemaColumn) {
+        return isCompatible(column, normalizedTypeName(column), schemaColumn);
+    }
+
+    /**
+     * @param typeName the column's type name as {@link #normalizedTypeName} returns it
+     */
+    static boolean isCompatible(Column column, String typeName, SchemaColumn schemaColumn) {
         final String type = lower(schemaColumn.getType());
-        final String typeName = normalizedTypeName(column);
         final int precision = valueOrUnset(schemaColumn.getPrecision());
         final int scale = valueOrUnset(schemaColumn.getScale());
         switch (type) {
@@ -172,12 +213,13 @@ final class OpenLogReplicatorTableReconciler {
                     return column.length() == precision && column.scale().isPresent() && column.scale().get() == scale;
                 }
                 // NUMBER or NUMBER(*,s); a model read over JDBC has length 0, one parsed from DDL has 38
+                // NUMBER(*,s) parsed by OracleDdlParser has scale 0, which cannot hold the values: not compatible
                 return (column.length() <= 0 || column.length() == NUMBER_MAX_PRECISION)
                         && (scale == OLR_UNSET ? column.scale().isEmpty() : column.scale().equals(Optional.of(scale)));
             case "varchar2":
-                return "VARCHAR2".equals(typeName) || "NVARCHAR2".equals(typeName);
+                return ("VARCHAR2".equals(typeName) || "NVARCHAR2".equals(typeName)) && characterLengthFits(column, schemaColumn);
             case "char":
-                return "CHAR".equals(typeName) || "NCHAR".equals(typeName);
+                return ("CHAR".equals(typeName) || "NCHAR".equals(typeName)) && characterLengthFits(column, schemaColumn);
             case "clob":
                 // OpenLogReplicator reports an XMLTYPE as clob, or as blob when stored as binary XML
                 return "CLOB".equals(typeName) || "NCLOB".equals(typeName) || isXmlType(typeName);
@@ -188,11 +230,28 @@ final class OpenLogReplicatorTableReconciler {
             case "timestamp":
                 return "TIMESTAMP".equals(typeName) && hasFraction(column) == hasFraction(schemaColumn);
             case "unknown":
-                // nothing to compare with
-                return true;
+                // e.g. XMLTYPE, JSON, BOOLEAN, object types; a type OpenLogReplicator names is no longer that type
+                return !TYPES_NAMED_BY_OLR.contains(typeName);
             default:
                 return typeName.equalsIgnoreCase(type);
         }
+    }
+
+    /**
+     * The metadata's length is in bytes; the model's is in bytes or, with character semantics or a national type, in
+     * characters, which take 1 to 4 bytes each and are capped at the type's byte limit.
+     */
+    private static boolean characterLengthFits(Column column, SchemaColumn schemaColumn) {
+        final int length = column.length();
+        if (schemaColumn.getLength() == null || length <= 0) {
+            return true;
+        }
+        final int bytes = schemaColumn.getLength();
+        if (bytes < length || bytes > length * MAX_BYTES_PER_CHARACTER) {
+            return false;
+        }
+        // byte limits of CHAR/NCHAR, VARCHAR2/NVARCHAR2 and extended VARCHAR2
+        return bytes % length == 0 || bytes == 2000 || bytes == 4000 || bytes == 32767;
     }
 
     /**
@@ -310,6 +369,11 @@ final class OpenLogReplicatorTableReconciler {
             default:
                 return column.typeName();
         }
+    }
+
+    /** The model column's type as DDL renders it, e.g. {@code NUMBER(15,3)}. */
+    static String describe(Column column) {
+        return typeDefinition(column);
     }
 
     private static int timePrecision(Column column) {

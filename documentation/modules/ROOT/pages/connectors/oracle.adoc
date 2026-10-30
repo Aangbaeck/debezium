@@ -6286,7 +6286,10 @@ While no offset can be read, OpenLogReplicator keeps its messages, and its queue
 [[oracle-openlogreplicator-table-model-reload]]
 === OpenLogReplicator table model reload
 
-When a change names a column that the connector's model of the table lacks, or a `NUMBER` column with another precision or scale, the connector reloads the model before it emits the change, for example after `DBMS_REDEFINITION` replaced the table without a DDL event.
+When a change names a column that the connector's model of the table lacks, or a column whose type in OpenLogReplicator's column metadata does not fit the model, the connector reloads the model before it emits the change, for example after `DBMS_REDEFINITION` replaced the table without a DDL event.
+A type does not fit when its family differs (for example `DATE` and `TIMESTAMP`), a `NUMBER` has another precision or scale, a `RAW` another length, a `TIMESTAMP` gains or loses its fraction, or a `CHAR` or `VARCHAR2` byte length is not the model's length times 1 to 4 bytes per character.
+The metadata has no fractional-second precision and only byte lengths, so a change from `TIMESTAMP(3)` to `TIMESTAMP(6)`, or a widening by a factor of 2 to 4 such as `VARCHAR2(10)` to `VARCHAR2(40)`, does not trigger a reload.
+Only columns with a value in the change are compared.
 It reads the table's DDL from the database, adjusts it to the column metadata that OpenLogReplicator sends with the change, and records the result in the schema history as a `CREATE TABLE`.
 
 The connector task fails instead, with an error that names the table and the change's SCN, when no model fits the change, or when the table had a message key and none of its key columns exist as of the change.

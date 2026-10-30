@@ -75,6 +75,8 @@ import io.debezium.schema.SchemaChangeEvent;
 import io.debezium.schema.SchemaTopicNamingStrategy;
 import io.debezium.snapshot.SnapshotterService;
 import io.debezium.spi.topic.TopicNamingStrategy;
+import io.debezium.time.MicroTimestamp;
+import io.debezium.time.Timestamp;
 import io.debezium.util.Clock;
 
 import oracle.sql.CharacterSet;
@@ -120,6 +122,8 @@ public class OpenLogReplicatorStaleTableModelTest {
         }
     }
 
+    private String snapshotDdl = OLD_DDL;
+
     private void start(String databaseDdl) throws Exception {
         start(databaseDdl, builder -> builder.with(OracleConnectorConfig.PDB_NAME, "PDB1"));
     }
@@ -146,7 +150,7 @@ public class OpenLogReplicatorStaleTableModelTest {
         // the snapshot's model
         final OracleOffsetContext snapshotOffset = offset(50, null, null);
         snapshotOffset.tableEvent(TABLE_ID, Instant.now());
-        schema.applySchemaChange(SchemaChangeEvent.ofSnapshotCreate(partition, snapshotOffset, TABLE_ID.catalog(), parse(OLD_DDL)));
+        schema.applySchemaChange(SchemaChangeEvent.ofSnapshotCreate(partition, snapshotOffset, TABLE_ID.catalog(), parse(snapshotDdl)));
 
         // Stands in for the dispatcher: the schema change is applied to the schema and its history.
         dispatcher = mock(EventDispatcher.class);
@@ -209,6 +213,55 @@ public class OpenLogReplicatorStaleTableModelTest {
         session.verify(connection).setSessionToPdb("PDB1");
         session.verify(connection).getTableMetadataDdl(TABLE_ID);
         session.verify(connection).resetSessionToCdb();
+    }
+
+    @Test
+    void shouldReloadModelWhenDateBecomesTimestamp() throws Exception {
+        // NS is NUMBER(*,2): the snapshot has its scale, OracleDdlParser parses the database's DDL with scale 0
+        snapshotDdl = ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"TS\" DATE, \"TXT\" VARCHAR2(10), \"NS\" NUMBER(38,2)");
+        final String newDdl = ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"TS\" TIMESTAMP (6), \"TXT\" VARCHAR2(10), \"NS\" NUMBER(*,2)");
+        start(newDdl);
+        assertThat(schema.schemaFor(TABLE_ID).valueSchema().field("TS").schema().name()).isEqualTo(Timestamp.SCHEMA_NAME);
+
+        read(begin(100, 1));
+        read(row(100, 2, "[" + id() + "," + column("TS", "\"type\":\"date\"") + "," + varchar("TXT", 10) + "," + number("NS", -1, 2) + "]",
+                "{\"ID\":1,\"TS\":1704067200000000000,\"TXT\":\"before\",\"NS\":\"1.25\"}"));
+        verify(dispatcher, never()).dispatchSchemaChangeEvent(any(), any(), any(), any());
+
+        final String newColumns = "[" + id() + "," + column("TS", "\"type\":\"timestamp\",\"length\":11") + "," + varchar("TXT", 10) + ","
+                + number("NS", -1, 2) + "]";
+        read(row(100, 3, newColumns, "{\"ID\":2,\"TS\":1704067200123456000,\"TXT\":\"after\",\"NS\":\"2.5\"}"));
+        read(row(100, 4, newColumns, "{\"ID\":3,\"TS\":1704067200654321000,\"TXT\":\"later\",\"NS\":\"3.33\"}"));
+
+        // one reload, before the first change of the new type; NS keeps the snapshot's scale
+        assertThat(schemaChanges).hasSize(1);
+        assertThat(schema.tableFor(TABLE_ID).columnWithName("NS").scale()).contains(2);
+        assertThat(schemaChangeOffsets.get(0)).containsEntry("scn", "100").containsEntry("scn_idx", 2L);
+        assertThat(schema.tableFor(TABLE_ID).columnWithName("TS").typeName()).isEqualTo("TIMESTAMP");
+        assertThat(schema.schemaFor(TABLE_ID).valueSchema().field("TS").schema().name()).isEqualTo(MicroTimestamp.SCHEMA_NAME);
+        assertThat(emittedValues()).containsExactly(3, 1704067200654321000L, "later", "3.33");
+    }
+
+    @Test
+    void shouldReloadModelWhenVarcharIsWidened() throws Exception {
+        snapshotDdl = ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"TXT\" VARCHAR2(10), \"WIDE\" VARCHAR2(10 CHAR)");
+        final String newDdl = ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"TXT\" VARCHAR2(50), \"WIDE\" VARCHAR2(10 CHAR)");
+        start(newDdl);
+
+        // WIDE has character semantics: 40 bytes in AL32UTF8 is its unchanged length
+        read(begin(100, 1));
+        read(row(100, 2, "[" + id() + "," + varchar("TXT", 10) + "," + varchar("WIDE", 40) + "]", "{\"ID\":1,\"TXT\":\"before\",\"WIDE\":\"w\"}"));
+        verify(dispatcher, never()).dispatchSchemaChangeEvent(any(), any(), any(), any());
+
+        final String newColumns = "[" + id() + "," + varchar("TXT", 50) + "," + varchar("WIDE", 40) + "]";
+        read(row(100, 3, newColumns, "{\"ID\":2,\"TXT\":\"a value longer than ten\",\"WIDE\":\"w\"}"));
+        read(row(100, 4, newColumns, "{\"ID\":3,\"TXT\":\"later\",\"WIDE\":\"w\"}"));
+
+        assertThat(schemaChanges).hasSize(1);
+        assertThat(schemaChanges.get(0).getDdl()).isEqualTo(newDdl);
+        assertThat(schema.tableFor(TABLE_ID).columnWithName("TXT").length()).isEqualTo(50);
+        assertThat(schema.tableFor(TABLE_ID).columnWithName("WIDE").length()).isEqualTo(10);
+        assertThat(emittedValues()).containsExactly(3, "later", "w");
     }
 
     @Test
@@ -506,6 +559,10 @@ public class OpenLogReplicatorStaleTableModelTest {
 
     private static String number(String name, int precision, int scale) {
         return "{\"name\":\"" + name + "\",\"type\":\"number\",\"precision\":" + precision + ",\"scale\":" + scale + ",\"nullable\":true}";
+    }
+
+    private static String column(String name, String metadata) {
+        return "{\"name\":\"" + name + "\"," + metadata + ",\"nullable\":true}";
     }
 
     private static String varchar(String name, int length) {
