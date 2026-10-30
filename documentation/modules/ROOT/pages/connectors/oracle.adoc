@@ -6283,6 +6283,18 @@ While no offset can be read, OpenLogReplicator keeps its messages, and its queue
 
 |===
 
+[[oracle-openlogreplicator-table-model-reload]]
+=== OpenLogReplicator table model reload
+
+When a change names a column that the connector's model of the table lacks, or a `NUMBER` column with another precision or scale, the connector reloads the model before it emits the change, for example after `DBMS_REDEFINITION` replaced the table without a DDL event.
+It reads the table's DDL from the database, adjusts it to the column metadata that OpenLogReplicator sends with the change, and records the result in the schema history as a `CREATE TABLE`.
+
+The connector task fails instead, with an error that names the table and the change's SCN, when no model fits the change, or when the table had a message key and none of its key columns exist as of the change.
+In the second case, define the key with `message.key.columns` if the table still has a suitable column.
+
+WARNING: `schema.history.internal.prefer.ddl=true` is not supported with this reload.
+On recovery, that option parses the recorded DDL, and the parser ignores a `CREATE TABLE` for a table that already exists, so the connector restarts with the model from before the reload.
+
 [[oracle-openlogreplicator-row-id-support]]
 === OpenLogReplicator ROWID support
 

@@ -157,6 +157,31 @@ public class OpenLogReplicatorTableReconcilerTest {
     }
 
     @Test
+    void shouldKeepKnownNumberWithScaleMinusOneButMapNewOneToFloat() throws Exception {
+        // NUMBER(p,-1) and FLOAT(p) are both sent as precision p, scale -1
+        assertThat(OpenLogReplicatorTableReconciler.isCompatible(parseColumn("NUMBER(10,-1)"), schemaColumn(number(10, -1)))).isTrue();
+        assertThat(describe(OpenLogReplicatorTableReconciler.toColumn(table(), schemaColumn(number(10, -1))))).isEqualTo(describe(parseColumn("FLOAT(10)")));
+    }
+
+    @Test
+    void shouldKeepXmlTypeReportedAsLob() throws Exception {
+        final Column parsed = parseColumn("XMLTYPE");
+        final Column fromJdbc = Column.editor().name("C").jdbcType(OracleTypes.SQLXML).type("SYS.XMLTYPE").create();
+        for (Column column : new Column[]{ parsed, fromJdbc }) {
+            assertThat(OpenLogReplicatorTableReconciler.isCompatible(column, schemaColumn(plain("clob")))).isTrue();
+            assertThat(OpenLogReplicatorTableReconciler.isCompatible(column, schemaColumn(plain("blob")))).isTrue();
+        }
+
+        final Table base = parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"X\" XMLTYPE");
+        assertThat(reconcile(base, null, "[" + ID + "," + col("X", plain("clob")) + "]", "{\"ID\":1}", null).table()).isSameAs(base);
+
+        // the database's X changed later; the last known XMLTYPE still fits the change
+        final Result result = reconcile(parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"X\" VARCHAR2(10)"), base,
+                "[" + ID + "," + col("X", plain("blob")) + "]", "{\"ID\":1}", null);
+        assertThat(describe(result.table().columnWithName("X"))).isEqualTo(describe(parsed));
+    }
+
+    @Test
     void shouldAcceptModelsReadOverJdbc() throws Exception {
         // a snapshot model has the JDBC driver's type names and a NUMBER without precision has length 0
         final Column number = Column.editor().name("C").jdbcType(OracleTypes.NUMBER).type("NUMBER").length(0).create();

@@ -152,7 +152,8 @@ final class OpenLogReplicatorTableReconciler {
     /**
      * Whether a model column can hold the values of a column OpenLogReplicator describes. Compares what the metadata
      * states exactly: the type family, a {@code NUMBER}'s precision and scale, a {@code RAW}'s length, and whether a
-     * {@code TIMESTAMP} has a fraction. Character lengths are in bytes in the metadata and not compared.
+     * {@code TIMESTAMP} has a fraction. Character lengths are in bytes in the metadata and not compared. An
+     * {@code XMLTYPE} fits a {@code clob} or {@code blob}.
      */
     static boolean isCompatible(Column column, SchemaColumn schemaColumn) {
         final String type = lower(schemaColumn.getType());
@@ -178,7 +179,10 @@ final class OpenLogReplicatorTableReconciler {
             case "char":
                 return "CHAR".equals(typeName) || "NCHAR".equals(typeName);
             case "clob":
-                return "CLOB".equals(typeName) || "NCLOB".equals(typeName);
+                // OpenLogReplicator reports an XMLTYPE as clob, or as blob when stored as binary XML
+                return "CLOB".equals(typeName) || "NCLOB".equals(typeName) || isXmlType(typeName);
+            case "blob":
+                return "BLOB".equals(typeName) || isXmlType(typeName);
             case "raw":
                 return "RAW".equals(typeName) && schemaColumn.getLength() != null && column.length() == schemaColumn.getLength();
             case "timestamp":
@@ -324,6 +328,10 @@ final class OpenLogReplicatorTableReconciler {
     /** The type name without a precision, as a model read over JDBC has it ({@code TIMESTAMP(6) WITH TIME ZONE}). */
     private static String normalizedTypeName(Column column) {
         return column.typeName() == null ? "" : column.typeName().replaceAll("\\(\\d+\\)", "").toUpperCase(Locale.ROOT);
+    }
+
+    private static boolean isXmlType(String typeName) {
+        return "XMLTYPE".equals(typeName) || "SYS.XMLTYPE".equals(typeName);
     }
 
     static String describe(SchemaColumn schemaColumn) {

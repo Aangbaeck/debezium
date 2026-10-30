@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,6 +51,7 @@ import io.debezium.pipeline.source.snapshot.incremental.SignalBasedIncrementalSn
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
 import io.debezium.pipeline.txmetadata.TransactionContext;
 import io.debezium.relational.Column;
+import io.debezium.relational.Key.KeyMapper;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
@@ -665,13 +667,6 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
         LOGGER.warn("The model of table {} does not match the change at SCN {} index {}: {}. Reloading it from the database.",
                 tableId, event.getCheckpointScn(), event.getCheckpointIndex(), mismatch);
 
-        // Positioned just before the change: a restart from an earlier transaction does not apply the new
-        // model to the changes before it, and the record's offset does not mark the change as emitted.
-        offsetContext.setScn(event.getCheckpointScn());
-        offsetContext.setScnIndex(event.getCheckpointIndex() == null ? null : event.getCheckpointIndex() - 1);
-        offsetContext.setEventScn(event.getCheckpointScn());
-        offsetContext.setTransactionId(event.getXid());
-
         String databaseDdl = null;
         Table fromDatabase = null;
         try {
@@ -679,12 +674,14 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
             fromDatabase = parseTable(tableId, databaseDdl);
         }
         catch (NonRelationalTableException e) {
+            throwIfSessionNotReset(e);
             LOGGER.warn("{} Building the model of table {} as of the change from the change and the last known model.", e.getMessage(), tableId);
         }
         catch (SQLException e) {
             if (e.getErrorCode() != ORA_OBJECT_NOT_FOUND) {
                 throw e;
             }
+            throwIfSessionNotReset(e);
             LOGGER.warn("Table {} was dropped while its DDL was read. Building its model as of the change from the change and the last known model.", tableId);
         }
 
@@ -706,6 +703,14 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
                             + "column metadata: %s. Restore a schema history that describes the table as of this change, or skip the change.",
                     tableId, event.getCheckpointScn(), event.getCheckpointIndex(), remaining));
         }
+        if (!keyColumns(table).isEmpty() && keyColumns(reconciled.table()).isEmpty()) {
+            throw new DebeziumException(String.format(
+                    "The model of table %s as of the change at SCN %s index %s has no message key: key column(s) %s no longer exist. "
+                            + "Compacted topics reject records without a key. Define the key with '%s', restore a schema history that "
+                            + "describes the table as of this change, or skip the change.",
+                    tableId, event.getCheckpointScn(), event.getCheckpointIndex(),
+                    keyColumns(table).stream().map(Column::name).collect(Collectors.toList()), OracleConnectorConfig.MSG_KEY_COLUMNS.name()));
+        }
         if (reconciled.primaryKeyDropped()) {
             LOGGER.warn("A primary key column of table {} does not exist as of the change at SCN {}; the model has no primary key.",
                     tableId, event.getCheckpointScn());
@@ -716,9 +721,29 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
                     reconciled.changes());
         }
 
+        // Positioned just before the change: a restart from an earlier transaction does not apply the new
+        // model to the changes before it, and the record's offset does not mark the change as emitted.
+        offsetContext.setScn(event.getCheckpointScn());
+        offsetContext.setScnIndex(event.getCheckpointIndex() == null ? null : event.getCheckpointIndex() - 1);
+        offsetContext.setEventScn(event.getCheckpointScn());
+        offsetContext.setTransactionId(event.getXid());
+
         final String ddl = fromDatabase != null && reconciled.changes().isEmpty() ? databaseDdl : OpenLogReplicatorTableReconciler.toDdl(reconciled.table());
         dispatchTableModel(reconciled.table(), ddl);
         return schema.tableFor(tableId);
+    }
+
+    /** The columns of a table's message key, from {@code message.key.columns} or else the primary key. */
+    private List<Column> keyColumns(Table table) {
+        final KeyMapper keyMapper = connectorConfig.getKeyMapper();
+        return keyMapper == null ? table.primaryKeyColumns() : keyMapper.getKeyKolumns(table);
+    }
+
+    /** A failed session reset is added as suppressed; it leaves the session in the PDB, so the change must not go on. */
+    private static <E extends Exception> void throwIfSessionNotReset(E e) throws E {
+        if (e.getSuppressed().length > 0) {
+            throw e;
+        }
     }
 
     /**

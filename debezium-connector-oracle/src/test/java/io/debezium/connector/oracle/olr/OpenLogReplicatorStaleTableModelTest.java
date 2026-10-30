@@ -30,6 +30,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.UnaryOperator;
 
+import org.apache.kafka.connect.errors.RetriableException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -64,6 +65,7 @@ import io.debezium.pipeline.spi.ChangeRecordEmitter;
 import io.debezium.pipeline.spi.Offsets;
 import io.debezium.pipeline.spi.SchemaChangeEventEmitter;
 import io.debezium.pipeline.txmetadata.TransactionContext;
+import io.debezium.relational.Column;
 import io.debezium.relational.CustomConverterRegistry;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
@@ -94,6 +96,10 @@ public class OpenLogReplicatorStaleTableModelTest {
     private static final String NEW_COLUMNS = "[" + id() + "," + varchar("TXT", 80) + "," + number("QTY", 18, 4) + "," + varchar("EXTRA", 20) + "]";
     private static final String OLD_ROW = "{\"ID\":1,\"QTY\":\"1.500\",\"TXT\":\"before\"}";
     private static final String NEW_ROW = "{\"ID\":1,\"TXT\":\"after\",\"QTY\":\"7.1255\",\"EXTRA\":\"set\"}";
+    /** The new layout with the key column renamed to ID2. */
+    private static final String RENAMED_KEY_COLUMNS = "[" + number("QTY", 18, 4) + "," + varchar("TXT", 80) + ","
+            + "{\"name\":\"ID2\",\"type\":\"number\",\"precision\":10,\"scale\":0,\"nullable\":false}," + varchar("EXTRA", 20) + "]";
+    private static final String RENAMED_KEY_ROW = "{\"QTY\":\"7.1255\",\"TXT\":\"after\",\"ID2\":1,\"EXTRA\":\"set\"}";
 
     private final ObjectMapper mapper = new ObjectMapper().enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
 
@@ -279,6 +285,52 @@ public class OpenLogReplicatorStaleTableModelTest {
 
         assertThat(schema.tableFor(TABLE_ID).retrieveColumnNames()).containsExactly("ID", "QTY", "TXT", "EXTRA");
         assertThat(emittedValues()).containsExactly(1, "7.1255", "after", "set");
+    }
+
+    @Test
+    void shouldFailBeforeRecordingModelWithoutKey() throws Exception {
+        start(NEW_DDL);
+        when(connection.getTableMetadataDdl(TABLE_ID)).thenThrow(new NonRelationalTableException("Table " + TABLE_ID + " was not found in ALL_ALL_TABLES."));
+        read(begin(200, 1));
+
+        assertThatThrownBy(() -> read(row(200, 2, RENAMED_KEY_COLUMNS, RENAMED_KEY_ROW)))
+                .isInstanceOf(DebeziumException.class)
+                .isNotInstanceOf(RetriableException.class)
+                .hasMessageContaining("The model of table " + TABLE_ID + " as of the change at SCN 200 index 2 has no message key")
+                .hasMessageContaining("[ID]")
+                .hasMessageContaining("message.key.columns");
+        verify(dispatcher, never()).dispatchSchemaChangeEvent(any(), any(), any(), any());
+        verify(dispatcher, never()).dispatchDataChangeEvent(any(), any(), any());
+        assertThat(schema.tableFor(TABLE_ID)).isEqualTo(parse(OLD_DDL));
+    }
+
+    @Test
+    void shouldRecordModelWithoutPrimaryKeyWhenMessageKeyColumnsExist() throws Exception {
+        start(NEW_DDL, builder -> builder.with(OracleConnectorConfig.PDB_NAME, "PDB1").with(OracleConnectorConfig.MSG_KEY_COLUMNS, "S1.DEBEZIUM.CAPTURED:ID2"));
+        when(connection.getTableMetadataDdl(TABLE_ID)).thenThrow(new NonRelationalTableException("Table " + TABLE_ID + " was not found in ALL_ALL_TABLES."));
+        read(begin(200, 1));
+        read(row(200, 2, RENAMED_KEY_COLUMNS, RENAMED_KEY_ROW));
+
+        final Table model = schema.tableFor(TABLE_ID);
+        assertThat(model.primaryKeyColumnNames()).isEmpty();
+        assertThat(connectorConfig.getKeyMapper().getKeyKolumns(model)).extracting(Column::name).containsExactly("ID2");
+        assertThat(schema.schemaFor(TABLE_ID).keySchema().fields()).extracting(org.apache.kafka.connect.data.Field::name).containsExactly("ID2");
+        assertThat(emittedValues()).containsExactlyInAnyOrder("7.1255", "after", 1, "set");
+    }
+
+    @Test
+    void shouldFailWhenSessionResetFailsAfterTableIsGone() throws Exception {
+        start(NEW_DDL);
+        when(connection.getTableMetadataDdl(TABLE_ID)).thenThrow(new NonRelationalTableException("Table " + TABLE_ID + " was not found in ALL_ALL_TABLES."));
+        doThrow(new RuntimeException(new SQLException("ORA-03114: not connected to ORACLE"))).when(connection).resetSessionToCdb();
+        read(begin(200, 1));
+
+        assertThatThrownBy(() -> read(row(200, 2, NEW_COLUMNS, NEW_ROW)))
+                .isInstanceOf(NonRelationalTableException.class)
+                .satisfies(e -> assertThat(e.getSuppressed()).singleElement()
+                        .satisfies(suppressed -> assertThat(suppressed).hasRootCauseMessage("ORA-03114: not connected to ORACLE")));
+        verify(dispatcher, never()).dispatchSchemaChangeEvent(any(), any(), any(), any());
+        verify(dispatcher, never()).dispatchDataChangeEvent(any(), any(), any());
     }
 
     @Test
