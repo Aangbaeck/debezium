@@ -91,6 +91,7 @@ public class OpenLogReplicatorStaleTableModelTest {
                 .with(OracleConnectorConfig.OLR_HOST, "127.0.0.1")
                 .with(OracleConnectorConfig.OLR_PORT, 1)
                 .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.CAPTURED")
+                .with(OracleConnectorConfig.PDB_NAME, "PDB1")
                 .build());
 
         model.set(oldTable());
@@ -159,6 +160,12 @@ public class OpenLogReplicatorStaleTableModelTest {
                 .containsEntry("scn_idx", 3L);
 
         assertThat(emittedValues()).containsExactly(1, "after", "7.1255", "set");
+
+        // the DDL is read in the PDB, and the main connection goes back to the root container
+        final InOrder session = inOrder(connection);
+        session.verify(connection).setSessionToPdb("PDB1");
+        session.verify(connection).getTableMetadataDdl(TABLE_ID);
+        session.verify(connection).resetSessionToCdb();
     }
 
     @Test

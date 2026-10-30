@@ -19,6 +19,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
+import io.debezium.connector.oracle.OracleConnection;
 import io.debezium.connector.oracle.OracleConnection.NonRelationalTableException;
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.OracleDatabaseSchema;
@@ -53,6 +54,7 @@ import io.debezium.relational.TableId;
 import io.debezium.relational.Tables.ColumnNameFilter;
 import io.debezium.snapshot.SnapshotterService;
 import io.debezium.util.Clock;
+import io.debezium.util.Strings;
 
 import oracle.sql.RAW;
 
@@ -724,7 +726,21 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
     }
 
     private void dispatchTableSchemaFromDatabase(TableId tableId) throws Exception {
-        final String tableDdl = connectionFactory.mainConnection().getTableMetadataDdl(tableId);
+        final OracleConnection connection = connectionFactory.mainConnection();
+        final String pdbName = connectorConfig.getPdbName();
+        final String tableDdl;
+        // The main connection stays in the root container while streaming, where a PDB's tables are not visible.
+        if (!Strings.isNullOrBlank(pdbName)) {
+            connection.setSessionToPdb(pdbName);
+        }
+        try {
+            tableDdl = connection.getTableMetadataDdl(tableId);
+        }
+        finally {
+            if (!Strings.isNullOrBlank(pdbName)) {
+                connection.resetSessionToCdb();
+            }
+        }
         dispatcher.dispatchSchemaChangeEvent(
                 partition,
                 offsetContext,
