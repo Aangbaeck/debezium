@@ -8,9 +8,12 @@ package io.debezium.connector.oracle.olr;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -18,15 +21,16 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
-import java.sql.Types;
+import java.sql.SQLException;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.UnaryOperator;
 
-import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
@@ -35,131 +39,164 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import io.debezium.DebeziumException;
+import io.debezium.config.Configuration;
 import io.debezium.connector.oracle.BaseChangeRecordEmitter;
 import io.debezium.connector.oracle.CommitScn;
 import io.debezium.connector.oracle.OracleConnection;
+import io.debezium.connector.oracle.OracleConnection.NonRelationalTableException;
 import io.debezium.connector.oracle.OracleConnectorConfig;
 import io.debezium.connector.oracle.OracleDatabaseSchema;
+import io.debezium.connector.oracle.OracleDefaultValueConverter;
 import io.debezium.connector.oracle.OracleOffsetContext;
 import io.debezium.connector.oracle.OraclePartition;
+import io.debezium.connector.oracle.OracleTaskContext;
+import io.debezium.connector.oracle.OracleValueConverters;
 import io.debezium.connector.oracle.Scn;
+import io.debezium.connector.oracle.StreamingAdapter;
+import io.debezium.connector.oracle.antlr.OracleDdlParser;
 import io.debezium.connector.oracle.jdbc.OracleConnectionFactory;
 import io.debezium.connector.oracle.olr.client.StreamingEvent;
-import io.debezium.connector.oracle.olr.client.payloads.AbstractMutationEvent;
 import io.debezium.connector.oracle.util.TestHelper;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.source.snapshot.incremental.SignalBasedIncrementalSnapshotContext;
 import io.debezium.pipeline.spi.ChangeRecordEmitter;
+import io.debezium.pipeline.spi.Offsets;
+import io.debezium.pipeline.spi.SchemaChangeEventEmitter;
 import io.debezium.pipeline.txmetadata.TransactionContext;
-import io.debezium.relational.Column;
+import io.debezium.relational.CustomConverterRegistry;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
-import io.debezium.relational.Tables.ColumnNameFilter;
+import io.debezium.relational.history.MemorySchemaHistory;
+import io.debezium.schema.SchemaChangeEvent;
+import io.debezium.schema.SchemaTopicNamingStrategy;
 import io.debezium.snapshot.SnapshotterService;
+import io.debezium.spi.topic.TopicNamingStrategy;
 import io.debezium.util.Clock;
 
+import oracle.sql.CharacterSet;
+
 /**
- * A table replaced under the same name without a DDL for it, as {@code DBMS_REDEFINITION} does, is reloaded from the
- * database when a change no longer fits its model.
+ * A table replaced under the same name without a DDL for it, as {@code DBMS_REDEFINITION} does, is reloaded when a
+ * change no longer fits its model. The reloaded model follows the change's column metadata when the table changed
+ * again, or was dropped, before the connector reached the change.
  */
 public class OpenLogReplicatorStaleTableModelTest {
 
     private static final String XID = "0x0001.002.00000003";
     private static final TableId TABLE_ID = new TableId("S1", "DEBEZIUM", "CAPTURED");
-    private static final String OLD_COLUMNS = "[" + number("ID", 10, 0) + "," + number("QTY", 15, 3) + "," + varchar("TXT", 40) + "]";
-    private static final String NEW_COLUMNS = "[" + number("ID", 10, 0) + "," + varchar("TXT", 80) + "," + number("QTY", 18, 4) + ","
-            + varchar("EXTRA", 20) + "]";
+
+    private static final String OLD_DDL = ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"QTY\" NUMBER(15,3), \"TXT\" VARCHAR2(40)");
+    private static final String NEW_DDL = ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"TXT\" VARCHAR2(80), \"QTY\" NUMBER(18,4), \"EXTRA\" VARCHAR2(20)");
+
+    private static final String OLD_COLUMNS = "[" + id() + "," + number("QTY", 15, 3) + "," + varchar("TXT", 40) + "]";
+    private static final String NEW_COLUMNS = "[" + id() + "," + varchar("TXT", 80) + "," + number("QTY", 18, 4) + "," + varchar("EXTRA", 20) + "]";
+    private static final String OLD_ROW = "{\"ID\":1,\"QTY\":\"1.500\",\"TXT\":\"before\"}";
+    private static final String NEW_ROW = "{\"ID\":1,\"TXT\":\"after\",\"QTY\":\"7.1255\",\"EXTRA\":\"set\"}";
 
     private final ObjectMapper mapper = new ObjectMapper().enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS);
 
     private OracleConnectorConfig connectorConfig;
     private OracleConnection connection;
+    private OracleConnectionFactory connectionFactory;
+    private OracleDatabaseSchema schema;
+    private OraclePartition partition;
     private EventDispatcher<OraclePartition, TableId> dispatcher;
     private OpenLogReplicatorStreamingChangeEventSource source;
-    private final AtomicReference<Table> model = new AtomicReference<>();
-    private final AtomicReference<Table> modelInDatabase = new AtomicReference<>();
+    private final List<SchemaChangeEvent> schemaChanges = new ArrayList<>();
     private final List<Map<String, Object>> schemaChangeOffsets = new ArrayList<>();
 
-    @BeforeEach
+    @AfterEach
+    void tearDown() {
+        if (schema != null) {
+            schema.close();
+        }
+    }
+
+    private void start(String databaseDdl) throws Exception {
+        start(databaseDdl, builder -> builder.with(OracleConnectorConfig.PDB_NAME, "PDB1"));
+    }
+
     @SuppressWarnings("unchecked")
-    void setUp() throws Exception {
-        connectorConfig = new OracleConnectorConfig(TestHelper.defaultConfig()
+    private void start(String databaseDdl, UnaryOperator<Configuration.Builder> config) throws Exception {
+        connectorConfig = new OracleConnectorConfig(config.apply(TestHelper.defaultConfig()
                 .with(OracleConnectorConfig.CONNECTOR_ADAPTER, "olr")
                 .with(OracleConnectorConfig.OLR_SOURCE, "S1")
                 .with(OracleConnectorConfig.OLR_HOST, "127.0.0.1")
                 .with(OracleConnectorConfig.OLR_PORT, 1)
                 .with(OracleConnectorConfig.TABLE_INCLUDE_LIST, "DEBEZIUM\\.CAPTURED")
-                .with(OracleConnectorConfig.PDB_NAME, "PDB1")
-                .build());
-
-        model.set(oldTable());
-        modelInDatabase.set(newTable());
-
-        final OracleDatabaseSchema schema = mock(OracleDatabaseSchema.class);
-        when(schema.tableFor(any())).thenAnswer(invocation -> TABLE_ID.equals(invocation.getArgument(0)) ? model.get() : null);
-        when(schema.getLobColumnsForTable(any())).thenReturn(Collections.emptyList());
-        final Tables tables = mock(Tables.class);
-        when(tables.removeTable(TABLE_ID)).thenAnswer(invocation -> model.getAndSet(null));
-        when(schema.getTables()).thenReturn(tables);
+                .with(OracleConnectorConfig.SCHEMA_HISTORY, MemorySchemaHistory.class)).build());
 
         connection = mock(OracleConnection.class);
-        when(connection.getTableMetadataDdl(TABLE_ID)).thenReturn("CREATE TABLE ...");
-        final OracleConnectionFactory connectionFactory = mock(OracleConnectionFactory.class);
+        when(connection.getNationalCharacterSet()).thenReturn(CharacterSet.make(CharacterSet.AL16UTF16_CHARSET));
+        when(connection.getDatabaseCharacterSet()).thenReturn(CharacterSet.make(CharacterSet.AL32UTF8_CHARSET));
+        when(connection.getTableMetadataDdl(TABLE_ID)).thenReturn(databaseDdl);
+        connectionFactory = mock(OracleConnectionFactory.class);
         when(connectionFactory.mainConnection()).thenReturn(connection);
 
-        // Stands in for the DDL parser: the dispatched CREATE TABLE installs the database's model, unless the
-        // table is still known, as the parser ignores CREATE TABLE for a table it has.
+        schema = createSchema();
+        partition = new OraclePartition(connectorConfig.getLogicalName(), "S1");
+        // the snapshot's model
+        final OracleOffsetContext snapshotOffset = offset(50, null, null);
+        snapshotOffset.tableEvent(TABLE_ID, Instant.now());
+        schema.applySchemaChange(SchemaChangeEvent.ofSnapshotCreate(partition, snapshotOffset, TABLE_ID.catalog(), parse(OLD_DDL)));
+
+        // Stands in for the dispatcher: the schema change is applied to the schema and its history.
         dispatcher = mock(EventDispatcher.class);
         doAnswer(invocation -> {
-            schemaChangeOffsets.add(new HashMap<>(((OracleOffsetContext) invocation.getArgument(1)).getOffset()));
-            model.compareAndSet(null, modelInDatabase.get());
+            final OracleOffsetContext offsetContext = invocation.getArgument(1);
+            ((SchemaChangeEventEmitter) invocation.getArgument(3)).emitSchemaChangeEvent(event -> {
+                schemaChanges.add(event);
+                schemaChangeOffsets.add(new HashMap<String, Object>(offsetContext.getOffset()));
+                schema.applySchemaChange(event);
+            });
             return null;
         }).when(dispatcher).dispatchSchemaChangeEvent(any(), any(), any(), any());
 
-        source = new OpenLogReplicatorStreamingChangeEventSource(connectorConfig, connectionFactory, dispatcher,
-                mock(ErrorHandler.class), Clock.system(), schema, mock(OpenLogReplicatorStreamingChangeEventSourceMetrics.class),
+        source = newSource(offset(50, null, null));
+    }
+
+    private OpenLogReplicatorStreamingChangeEventSource newSource(OracleOffsetContext offsetContext) throws Exception {
+        final OpenLogReplicatorStreamingChangeEventSource newSource = new OpenLogReplicatorStreamingChangeEventSource(connectorConfig, connectionFactory,
+                dispatcher, mock(ErrorHandler.class), Clock.system(), schema, mock(OpenLogReplicatorStreamingChangeEventSourceMetrics.class),
                 mock(SnapshotterService.class));
-        source.init(OracleOffsetContext.create()
-                .logicalName(connectorConfig)
-                .scn(Scn.valueOf(50))
-                .commitScn(CommitScn.empty())
-                .snapshotPendingTransactions(Collections.emptyMap())
-                .transactionContext(new TransactionContext())
-                .incrementalSnapshotContext(new SignalBasedIncrementalSnapshotContext<>())
-                .build());
+        newSource.init(offsetContext);
+        setField(newSource, "partition", partition);
+        return newSource;
     }
 
     @Test
-    void shouldKeepModelForChangeThatFitsIt() throws Exception {
+    void shouldDoNoExtraWorkForChangeThatFitsModel() throws Exception {
+        start(NEW_DDL);
         read(begin(100, 1));
-        read(row(100, 2, OLD_COLUMNS, "{\"ID\":1,\"QTY\":\"1.500\",\"TXT\":\"before\"}"));
+        read(row(100, 2, OLD_COLUMNS, OLD_ROW));
+        read(row(100, 3, "[" + id() + "," + number("QTY", 15, 3) + "," + varchar("TXT", 40) + "," + varchar("SYS_NC00004$", 1) + "]", OLD_ROW));
 
+        verify(connectionFactory, never()).mainConnection();
         verify(dispatcher, never()).dispatchSchemaChangeEvent(any(), any(), any(), any());
-        verify(connection, never()).getTableMetadataDdl(any());
         assertThat(emittedValues()).containsExactly(1, "1.500", "before");
     }
 
     @Test
     void shouldReloadModelBeforeChangeOfReplacedTable() throws Exception {
+        start(NEW_DDL);
         read(begin(100, 1));
-        read(row(100, 2, OLD_COLUMNS, "{\"ID\":1,\"QTY\":\"1.500\",\"TXT\":\"before\"}"));
+        read(row(100, 2, OLD_COLUMNS, OLD_ROW));
         read(commit(100, 3));
         read(begin(200, 1));
-        read(row(200, 4, NEW_COLUMNS, "{\"ID\":1,\"TXT\":\"after\",\"QTY\":\"7.1255\",\"EXTRA\":\"set\"}"));
+        read(row(200, 4, NEW_COLUMNS, NEW_ROW));
 
         final InOrder order = inOrder(dispatcher);
         order.verify(dispatcher).dispatchSchemaChangeEvent(any(), any(), eq(TABLE_ID), any());
         order.verify(dispatcher).dispatchDataChangeEvent(any(), eq(TABLE_ID), any());
 
-        // just before the change: its transaction and commit SCN, and an index the change itself is above
-        assertThat(schemaChangeOffsets).hasSize(1);
-        assertThat(schemaChangeOffsets.get(0))
-                .containsEntry("scn", "200")
-                .containsEntry("scn_idx", 3L);
-
+        // the database's DDL, just before the change: its transaction and commit SCN, and an index the change is above
+        assertThat(schemaChanges).hasSize(1);
+        assertThat(schemaChanges.get(0).getDdl()).isEqualTo(NEW_DDL);
+        assertThat(schemaChangeOffsets.get(0)).containsEntry("scn", "200").containsEntry("scn_idx", 3L);
         assertThat(emittedValues()).containsExactly(1, "after", "7.1255", "set");
+        assertThat(schema.tableFor(TABLE_ID)).isEqualTo(parse(NEW_DDL));
 
         // the DDL is read in the PDB, and the main connection goes back to the root container
         final InOrder session = inOrder(connection);
@@ -169,88 +206,217 @@ public class OpenLogReplicatorStaleTableModelTest {
     }
 
     @Test
-    void shouldReloadModelWhenNumberScaleChanged() throws Exception {
-        modelInDatabase.set(table(15, 4));
+    void shouldAddColumnDroppedAgainBeforeCatchUp() throws Exception {
+        // EXTRA came with the redefinition and was dropped before the connector reached the change
+        start(ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"TXT\" VARCHAR2(80), \"QTY\" NUMBER(18,4)"));
         read(begin(200, 1));
-        read(row(200, 2, "[" + number("ID", 10, 0) + "," + number("QTY", 15, 4) + "," + varchar("TXT", 40) + "]",
-                "{\"ID\":1,\"QTY\":\"7.1255\",\"TXT\":\"after\"}"));
+        read(row(200, 2, NEW_COLUMNS, NEW_ROW));
 
-        verify(dispatcher).dispatchSchemaChangeEvent(any(), any(), eq(TABLE_ID), any());
-        assertThat(model.get().columnWithName("QTY").scale()).contains(4);
+        final Table model = schema.tableFor(TABLE_ID);
+        assertThat(model.retrieveColumnNames()).containsExactly("ID", "TXT", "QTY", "EXTRA");
+        assertThat(model.columnWithName("EXTRA").typeName()).isEqualTo("VARCHAR2");
+        assertThat(model.columnWithName("EXTRA").length()).isEqualTo(20);
+        assertThat(model.primaryKeyColumnNames()).containsExactly("ID");
+        assertThat(emittedValues()).containsExactly(1, "after", "7.1255", "set");
+        assertRecordedModelParsesFromItsDdl();
     }
 
     @Test
-    void shouldFailWhenReloadedModelDoesNotFitEither() throws Exception {
-        // the table changed again after the change was written
-        modelInDatabase.set(oldTable());
+    void shouldUseChangePrecisionModifiedAgainBeforeCatchUp() throws Exception {
+        start(ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"TXT\" VARCHAR2(80), \"QTY\" NUMBER(20,6), \"EXTRA\" VARCHAR2(20)"));
+        read(begin(200, 1));
+        read(row(200, 2, NEW_COLUMNS, NEW_ROW));
+
+        assertThat(schema.tableFor(TABLE_ID).columnWithName("QTY").length()).isEqualTo(18);
+        assertThat(schema.tableFor(TABLE_ID).columnWithName("QTY").scale()).contains(4);
+        assertThat(emittedValues()).containsExactly(1, "after", "7.1255", "set");
+        assertRecordedModelParsesFromItsDdl();
+
+        // a change written after the MODIFY reloads the database's model as it is
+        read(row(200, 3, "[" + id() + "," + varchar("TXT", 80) + "," + number("QTY", 20, 6) + "," + varchar("EXTRA", 20) + "]",
+                "{\"ID\":2,\"TXT\":\"later\",\"QTY\":\"1.123456\",\"EXTRA\":\"x\"}"));
+        assertThat(schemaChanges).hasSize(2);
+        assertThat(schemaChanges.get(1).getDdl()).startsWith("CREATE TABLE \"DEBEZIUM\".\"CAPTURED\" \n");
+        assertThat(schema.tableFor(TABLE_ID).columnWithName("QTY").scale()).contains(6);
+    }
+
+    @Test
+    void shouldLeaveOutColumnAddedAgainBeforeCatchUp() throws Exception {
+        start(ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"TXT\" VARCHAR2(80), \"QTY\" NUMBER(18,4), \"EXTRA\" VARCHAR2(20), \"LATER\" DATE"));
+        read(begin(200, 1));
+        read(row(200, 2, NEW_COLUMNS, NEW_ROW));
+
+        assertThat(schema.tableFor(TABLE_ID).retrieveColumnNames()).containsExactly("ID", "TXT", "QTY", "EXTRA");
+        assertThat(emittedValues()).containsExactly(1, "after", "7.1255", "set");
+        assertRecordedModelParsesFromItsDdl();
+    }
+
+    @Test
+    void shouldBuildModelOfTableDroppedBeforeCatchUp() throws Exception {
+        start(NEW_DDL);
+        when(connection.getTableMetadataDdl(TABLE_ID)).thenThrow(new NonRelationalTableException("Table " + TABLE_ID + " was not found in ALL_ALL_TABLES."));
+        read(begin(200, 1));
+        read(row(200, 2, NEW_COLUMNS, NEW_ROW));
+
+        // the last known model's columns where they still fit, the change's metadata otherwise
+        final Table model = schema.tableFor(TABLE_ID);
+        assertThat(model.retrieveColumnNames()).containsExactly("ID", "QTY", "TXT", "EXTRA");
+        assertThat(model.columnWithName("QTY").length()).isEqualTo(18);
+        assertThat(model.columnWithName("TXT").length()).isEqualTo(40);
+        assertThat(model.primaryKeyColumnNames()).containsExactly("ID");
+        assertThat(schemaChangeOffsets.get(0)).containsEntry("scn", "200").containsEntry("scn_idx", 1L);
+        assertThat(emittedValues()).containsExactly(1, "7.1255", "after", "set");
+        assertRecordedModelParsesFromItsDdl();
+        verify(connection).resetSessionToCdb();
+    }
+
+    @Test
+    void shouldBuildModelOfTableDroppedWhileItsDdlIsRead() throws Exception {
+        start(NEW_DDL);
+        when(connection.getTableMetadataDdl(TABLE_ID)).thenThrow(new SQLException("ORA-31603: object \"CAPTURED\" of type TABLE not found", "99999", 31603));
+        read(begin(200, 1));
+        read(row(200, 2, NEW_COLUMNS, NEW_ROW));
+
+        assertThat(schema.tableFor(TABLE_ID).retrieveColumnNames()).containsExactly("ID", "QTY", "TXT", "EXTRA");
+        assertThat(emittedValues()).containsExactly(1, "7.1255", "after", "set");
+    }
+
+    @Test
+    void shouldFailWhenColumnTypeCannotBeDerived() throws Exception {
+        start(NEW_DDL);
+        when(connection.getTableMetadataDdl(TABLE_ID)).thenThrow(new NonRelationalTableException("Table " + TABLE_ID + " was not found in ALL_ALL_TABLES."));
         read(begin(200, 1));
 
-        assertThatThrownBy(() -> read(row(200, 2, NEW_COLUMNS, "{\"ID\":1,\"TXT\":\"after\",\"QTY\":\"7.1255\",\"EXTRA\":\"set\"}")))
+        assertThatThrownBy(() -> read(row(200, 2, "[" + id() + "," + number("QTY", 15, 3) + "," + varchar("TXT", 40) + ","
+                + "{\"name\":\"TS\",\"type\":\"timestamp\",\"length\":11,\"nullable\":true}]", "{\"ID\":1,\"QTY\":\"1.5\",\"TXT\":\"x\",\"TS\":\"2024-01-01\"}")))
                 .isInstanceOf(DebeziumException.class)
-                .hasMessageContaining("reloaded from the database does not match");
+                .hasMessageContaining("The model of table " + TABLE_ID + " cannot be built for the change at SCN 200 index 2")
+                .hasMessageContaining("column TS of table " + TABLE_ID + " is timestamp length 11 in the change");
+        verify(dispatcher, never()).dispatchSchemaChangeEvent(any(), any(), any(), any());
         verify(dispatcher, never()).dispatchDataChangeEvent(any(), any(), any());
     }
 
     @Test
-    void shouldNotFindMismatchForMatchingChange() throws Exception {
-        assertThat(mismatch(OLD_COLUMNS, "{\"ID\":1,\"QTY\":\"1.5\",\"TXT\":\"x\"}", null)).isNull();
+    void shouldFailWhenNoModelFitsChange() throws Exception {
+        // without column metadata nothing but the database describes the table
+        start(OLD_DDL);
+        read(begin(200, 1));
+
+        assertThatThrownBy(() -> read("{" + header(200, 2) + "\"payload\":[{\"op\":\"c\",\"schema\":{\"owner\":\"DEBEZIUM\",\"table\":\"CAPTURED\"},"
+                + "\"after\":" + NEW_ROW + "}]}"))
+                .isInstanceOf(DebeziumException.class)
+                .hasMessageContaining("does not match the change at SCN 200 index 2 even after reloading it")
+                .hasMessageContaining("column EXTRA is not in the model");
+        verify(dispatcher, never()).dispatchDataChangeEvent(any(), any(), any());
     }
 
     @Test
-    void shouldIgnoreColumnsOnlyInSchema() throws Exception {
-        // hidden, guard and unused columns are in the schema, never among the values
-        final String columns = "[" + number("ID", 10, 0) + "," + number("QTY", 15, 3) + "," + varchar("TXT", 40) + ","
-                + varchar("SYS_NC00005$", 1) + "]";
-        assertThat(mismatch(columns, "{\"ID\":1,\"QTY\":\"1.5\",\"TXT\":\"x\"}", null)).isNull();
+    void shouldResetSessionWhenDdlCannotBeRead() throws Exception {
+        start(NEW_DDL);
+        when(connection.getTableMetadataDdl(TABLE_ID)).thenThrow(new SQLException("ORA-01031: insufficient privileges", "42000", 1031));
+        read(begin(200, 1));
+
+        assertThatThrownBy(() -> read(row(200, 2, NEW_COLUMNS, NEW_ROW)))
+                .isInstanceOf(SQLException.class)
+                .hasMessageContaining("ORA-01031");
+        final InOrder session = inOrder(connection);
+        session.verify(connection).setSessionToPdb("PDB1");
+        session.verify(connection).resetSessionToCdb();
     }
 
     @Test
-    void shouldFindValueForUnknownColumn() throws Exception {
-        assertThat(mismatch(NEW_COLUMNS, "{\"ID\":1,\"QTY\":\"1.5\",\"TXT\":\"x\",\"EXTRA\":\"e\"}", null))
-                .isEqualTo("column EXTRA is not in the model");
+    void shouldKeepDdlFailureWhenSessionResetFailsToo() throws Exception {
+        start(NEW_DDL);
+        when(connection.getTableMetadataDdl(TABLE_ID)).thenThrow(new SQLException("ORA-03113: end-of-file on communication channel", "08000", 3113));
+        doThrow(new RuntimeException(new SQLException("ORA-03114: not connected to ORACLE"))).when(connection).resetSessionToCdb();
+        read(begin(200, 1));
+
+        assertThatThrownBy(() -> read(row(200, 2, NEW_COLUMNS, NEW_ROW)))
+                .isInstanceOf(SQLException.class)
+                .hasMessageContaining("ORA-03113")
+                .satisfies(e -> assertThat(e.getSuppressed()).singleElement()
+                        .satisfies(suppressed -> assertThat(suppressed).hasRootCauseMessage("ORA-03114: not connected to ORACLE")));
     }
 
     @Test
-    void shouldIgnoreValueForExcludedColumn() throws Exception {
-        final ColumnNameFilter excludeExtra = (catalog, schema, table, column) -> !"EXTRA".equals(column);
-        assertThat(mismatch(OLD_COLUMNS, "{\"ID\":1,\"QTY\":\"1.5\",\"TXT\":\"x\",\"EXTRA\":\"e\"}", excludeExtra)).isNull();
+    void shouldReadDdlInCurrentContainerWithoutPdb() throws Exception {
+        start(NEW_DDL, builder -> builder.without(OracleConnectorConfig.PDB_NAME.name()));
+        read(begin(200, 1));
+        read(row(200, 2, NEW_COLUMNS, NEW_ROW));
+
+        verify(connection).getTableMetadataDdl(TABLE_ID);
+        verify(connection, never()).setSessionToPdb(anyString());
+        verify(connection, never()).resetSessionToCdb();
+        assertThat(emittedValues()).containsExactly(1, "after", "7.1255", "set");
     }
 
     @Test
-    void shouldFindNumberPrecisionOrScaleChange() throws Exception {
-        final String values = "{\"ID\":1,\"QTY\":\"1.5\",\"TXT\":\"x\"}";
-        assertThat(mismatch("[" + number("ID", 10, 0) + "," + number("QTY", 15, 4) + "]", values, null))
-                .isEqualTo("column QTY is NUMBER(15,4) in the change and NUMBER(15,3) in the model");
-        assertThat(mismatch("[" + number("ID", 12, 0) + "]", values, null))
-                .isEqualTo("column ID is NUMBER(12,0) in the change and NUMBER(10,0) in the model");
+    void shouldRecoverAndReplayAroundRecordedModel() throws Exception {
+        // the table was dropped before the connector caught up, so only the history has the model of the change
+        start(NEW_DDL);
+        when(connection.getTableMetadataDdl(TABLE_ID)).thenThrow(new NonRelationalTableException("Table " + TABLE_ID + " was not found in ALL_ALL_TABLES."));
+        read(begin(200, 1));
+        read(row(200, 4, NEW_COLUMNS, NEW_ROW));
+        final Table recorded = schema.tableFor(TABLE_ID);
+        assertThat(schemaChangeOffsets.get(0)).containsEntry("scn", "200").containsEntry("scn_idx", 3L).containsEntry("txId", XID);
+
+        // restart from an earlier transaction: the record is not applied, the earlier changes keep their model
+        recover(offset(100, 2L, "0x0001.001.00000001"));
+        assertThat(schema.tableFor(TABLE_ID)).isEqualTo(parse(OLD_DDL));
+
+        // restart from the record's own offset: the record is applied and the change is not skipped
+        recover(offset(200, 3L, XID));
+        assertThat(schema.tableFor(TABLE_ID)).isEqualTo(recorded);
+
+        clearInvocations(dispatcher, connection, connectionFactory);
+        source = newSource(offset(200, 3L, XID));
+        setField(source, "replayScn", Scn.valueOf(200));
+        setField(source, "replayScnIndex", 3L);
+        setField(source, "replayTransactionId", XID);
+        read(begin(200, 1));
+        read(row(200, 4, NEW_COLUMNS, NEW_ROW));
+
+        verify(connectionFactory, never()).mainConnection();
+        verify(dispatcher, never()).dispatchSchemaChangeEvent(any(), any(), any(), any());
+        assertThat(emittedValues()).containsExactly(1, "7.1255", "after", "set");
     }
 
-    @Test
-    void shouldFindNumberThatChangedType() throws Exception {
-        assertThat(mismatch("[" + number("ID", 10, 0) + "," + varchar("QTY", 20) + "]", "{\"ID\":1,\"QTY\":\"a\"}", null))
-                .isEqualTo("column QTY is varchar2 in the change and NUMBER in the model");
+    private void recover(OracleOffsetContext offsetContext) throws InterruptedException {
+        schema.getTables().clear();
+        schema.recover(Offsets.of(partition, offsetContext));
     }
 
-    @Test
-    void shouldIgnoreNumberWithoutDeclaredPrecision() throws Exception {
-        final String values = "{\"ID\":1,\"QTY\":\"1.5\",\"TXT\":\"x\"}";
-        // NUMBER and NUMBER(*,0) have no precision in the dictionary
-        assertThat(mismatch("[" + number("QTY", -1, -127) + "," + number("ID", 0, 0) + "]", values, null)).isNull();
-        // FLOAT is a NUMBER with a binary precision in the dictionary, and FLOAT in the model
-        final Table table = Table.editor().tableId(TABLE_ID)
-                .addColumn(Column.editor().name("F").jdbcType(Types.FLOAT).type("FLOAT").length(126).position(1).create())
-                .create();
-        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(table,
-                mutation("[" + number("F", 126, -127) + "]", "{\"F\":\"1.5\"}"), null)).isNull();
+    /** With {@code schema.history.internal.prefer.ddl}, recovery parses the recorded DDL instead of the table change. */
+    private void assertRecordedModelParsesFromItsDdl() {
+        final SchemaChangeEvent event = schemaChanges.get(schemaChanges.size() - 1);
+        assertThat(event.getDdl()).startsWith("CREATE TABLE \"DEBEZIUM\".\"CAPTURED\" (");
+        final Table parsed = parse(event.getDdl());
+        assertThat(parsed.retrieveColumnNames()).isEqualTo(event.getTables().iterator().next().retrieveColumnNames());
+        assertThat(parsed).isEqualTo(schema.tableFor(TABLE_ID));
     }
 
-    private String mismatch(String columns, String after, ColumnNameFilter filter) throws Exception {
-        return OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(oldTable(), mutation(columns, after), filter);
+    @SuppressWarnings({ "rawtypes", "unchecked" })
+    private OracleDatabaseSchema createSchema() {
+        final TopicNamingStrategy topicNamingStrategy = SchemaTopicNamingStrategy.create(connectorConfig);
+        final OracleValueConverters converters = connectorConfig.getAdapter().getValueConverter(connectorConfig, connection);
+        final OracleDatabaseSchema databaseSchema = new OracleDatabaseSchema(connectorConfig, converters, new OracleDefaultValueConverter(converters, connection),
+                connectorConfig.schemaNameAdjuster(), topicNamingStrategy, StreamingAdapter.TableNameCaseSensitivity.INSENSITIVE,
+                false, new CustomConverterRegistry(List.of()), new OracleTaskContext(connectorConfig.getConfig(), connectorConfig));
+        databaseSchema.initializeStorage();
+        return databaseSchema;
     }
 
-    private AbstractMutationEvent mutation(String columns, String after) throws Exception {
-        final StreamingEvent event = mapper.readValue(row(100, 2, columns, after), StreamingEvent.class);
-        return (AbstractMutationEvent) event.getPayload().get(0);
+    private OracleOffsetContext offset(long scn, Long index, String transactionId) {
+        return OracleOffsetContext.create()
+                .logicalName(connectorConfig)
+                .scn(Scn.valueOf(scn))
+                .scnIndex(index)
+                .transactionId(transactionId)
+                .commitScn(CommitScn.empty())
+                .snapshotPendingTransactions(Collections.emptyMap())
+                .transactionContext(new TransactionContext())
+                .incrementalSnapshotContext(new SignalBasedIncrementalSnapshotContext<>())
+                .build();
     }
 
     private Object[] emittedValues() throws Exception {
@@ -261,31 +427,29 @@ public class OpenLogReplicatorStaleTableModelTest {
         return (Object[]) field.get(emitter.getAllValues().get(emitter.getAllValues().size() - 1));
     }
 
-    private static Table oldTable() {
-        return table(15, 3);
+    private static void setField(Object target, String name, Object value) throws Exception {
+        final Field field = OpenLogReplicatorStreamingChangeEventSource.class.getDeclaredField(name);
+        field.setAccessible(true);
+        field.set(target, value);
     }
 
-    private static Table newTable() {
-        return Table.editor().tableId(TABLE_ID)
-                .addColumn(numberColumn("ID", 10, 0, 1))
-                .addColumn(Column.editor().name("TXT").jdbcType(Types.VARCHAR).type("VARCHAR2").length(80).position(2).create())
-                .addColumn(numberColumn("QTY", 18, 4, 3))
-                .addColumn(Column.editor().name("EXTRA").jdbcType(Types.VARCHAR).type("VARCHAR2").length(20).position(4).create())
-                .setPrimaryKeyNames("ID")
-                .create();
+    private static Table parse(String ddl) {
+        final OracleDdlParser parser = new OracleDdlParser();
+        parser.setCurrentDatabase(TABLE_ID.catalog());
+        parser.setCurrentSchema(TABLE_ID.schema());
+        final Tables tables = new Tables();
+        parser.parse(ddl, tables);
+        return tables.forTable(TABLE_ID);
     }
 
-    private static Table table(int qtyPrecision, int qtyScale) {
-        return Table.editor().tableId(TABLE_ID)
-                .addColumn(numberColumn("ID", 10, 0, 1))
-                .addColumn(numberColumn("QTY", qtyPrecision, qtyScale, 2))
-                .addColumn(Column.editor().name("TXT").jdbcType(Types.VARCHAR).type("VARCHAR2").length(40).position(3).create())
-                .setPrimaryKeyNames("ID")
-                .create();
+    /** A table as {@code DBMS_METADATA.GET_DDL} renders it, with a primary key on {@code ID}. */
+    private static String ddl(String columns) {
+        return "CREATE TABLE \"DEBEZIUM\".\"CAPTURED\" \n   (\t" + columns.replace(", \"", ", \n\t\"")
+                + ", \n\t PRIMARY KEY (\"ID\")\n  USING INDEX  ENABLE\n   ) ;";
     }
 
-    private static Column numberColumn(String name, int precision, int scale, int position) {
-        return Column.editor().name(name).jdbcType(Types.NUMERIC).type("NUMBER").length(precision).scale(scale).position(position).create();
+    private static String id() {
+        return "{\"name\":\"ID\",\"type\":\"number\",\"precision\":10,\"scale\":0,\"nullable\":false}";
     }
 
     private static String number(String name, int precision, int scale) {
