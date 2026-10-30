@@ -17,11 +17,13 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
 import java.sql.SQLException;
+import java.sql.Types;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -262,6 +264,73 @@ public class OpenLogReplicatorStaleTableModelTest {
         assertThat(schema.tableFor(TABLE_ID).columnWithName("TXT").length()).isEqualTo(50);
         assertThat(schema.tableFor(TABLE_ID).columnWithName("WIDE").length()).isEqualTo(10);
         assertThat(emittedValues()).containsExactly(3, "later", "w");
+    }
+
+    @Test
+    void shouldReloadOnceForNumberWithAsterisk() throws Exception {
+        // OracleDdlParser parses NUMBER(*) with scale 0; OpenLogReplicator sends no precision and no scale
+        assertReloadedOnceForParserQuirk("\"N\" NUMBER(*)", "\"N\" NUMBER", number("N", -1, -1), "\"N\":\"1.5\"");
+        assertThat(schema.tableFor(TABLE_ID).columnWithName("N").scale()).isEmpty();
+    }
+
+    @Test
+    void shouldReloadOnceForCharacterVarying() throws Exception {
+        // OracleDdlParser parses CHARACTER VARYING as CHAR; the database stores VARCHAR2
+        assertReloadedOnceForParserQuirk("\"V\" CHARACTER VARYING(10)", "\"V\" VARCHAR2(10)", varchar("V", 10), "\"V\":\"x\"");
+        assertThat(schema.tableFor(TABLE_ID).columnWithName("V").typeName()).isEqualTo("VARCHAR2");
+    }
+
+    @Test
+    void shouldNotReloadForLongRaw() throws Exception {
+        // OpenLogReplicator's default unknown-type HIDE never sends LONG RAW values; one that arrives fits the model too
+        snapshotDdl = ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"LR\" LONG RAW");
+        start(snapshotDdl);
+        read(begin(100, 1));
+        final String columns = "[" + id() + "," + column("LR", "\"type\":\"long raw\"") + "]";
+        read(row(100, 2, columns, "{\"ID\":1}"));
+        read(row(100, 3, columns, "{\"ID\":2,\"LR\":\"00\"}"));
+
+        verify(connection, never()).getTableMetadataDdl(TABLE_ID);
+        verify(dispatcher, never()).dispatchSchemaChangeEvent(any(), any(), any(), any());
+        verify(dispatcher, times(2)).dispatchDataChangeEvent(any(), eq(TABLE_ID), any());
+    }
+
+    @Test
+    void shouldReloadModelOfTableWithLongRaw() throws Exception {
+        snapshotDdl = ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"TXT\" VARCHAR2(10)");
+        final String newDdl = ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"TXT\" VARCHAR2(50), \"LR\" LONG RAW");
+        start(newDdl);
+
+        read(begin(100, 1));
+        final String newColumns = "[" + id() + "," + varchar("TXT", 50) + "," + column("LR", "\"type\":\"long raw\"") + "]";
+        read(row(100, 2, newColumns, "{\"ID\":1,\"TXT\":\"a value longer than ten\"}"));
+        read(row(100, 3, newColumns, "{\"ID\":2,\"TXT\":\"later\"}"));
+
+        assertThat(schemaChanges).hasSize(1);
+        assertThat(schemaChanges.get(0).getDdl()).isEqualTo(newDdl);
+        verify(connection).getTableMetadataDdl(TABLE_ID);
+        final Table model = schema.tableFor(TABLE_ID);
+        assertThat(model.columnWithName("TXT").length()).isEqualTo(50);
+        assertThat(model.columnWithName("LR").typeName()).isEqualTo("LONG RAW");
+        assertThat(model.columnWithName("LR").jdbcType()).isEqualTo(Types.LONGVARBINARY);
+        assertThat(emittedValues()).containsExactly(2, "later", null);
+    }
+
+    /** A column parsed differently from how OpenLogReplicator describes it is reloaded once, then fits every change. */
+    private void assertReloadedOnceForParserQuirk(String snapshotColumn, String databaseColumn, String metadata, String value) throws Exception {
+        snapshotDdl = ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, " + snapshotColumn);
+        final String databaseDdl = ddl("\"ID\" NUMBER(10,0) NOT NULL ENABLE, " + databaseColumn);
+        start(databaseDdl);
+        final String columns = "[" + id() + "," + metadata + "]";
+        read(begin(100, 1));
+        for (int i = 2; i <= 5; i++) {
+            read(row(100, i, columns, "{\"ID\":" + i + "," + value + "}"));
+        }
+
+        assertThat(schemaChanges).hasSize(1);
+        assertThat(schemaChanges.get(0).getDdl()).isEqualTo(databaseDdl);
+        verify(connection).getTableMetadataDdl(TABLE_ID);
+        verify(dispatcher, times(4)).dispatchDataChangeEvent(any(), eq(TABLE_ID), any());
     }
 
     @Test

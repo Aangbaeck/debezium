@@ -196,8 +196,11 @@ public class OpenLogReplicatorTableReconcilerTest {
         // NUMBER(*,2) over JDBC: no precision, the dictionary's scale
         final Column numberWithScale = Column.editor().name("C").jdbcType(OracleTypes.NUMBER).type("NUMBER").length(0).scale(2).create();
         assertThat(OpenLogReplicatorTableReconciler.isCompatible(numberWithScale, schemaColumn(number(-1, 2)))).isTrue();
-        // OracleDdlParser cannot parse LONG RAW
-        final Column longRaw = Column.editor().name("C").jdbcType(OracleTypes.LONGVARBINARY).type("LONG RAW").create();
+        // INTEGER over JDBC: ojdbc reports precision 38
+        final Column integer = Column.editor().name("C").jdbcType(OracleTypes.NUMBER).type("NUMBER").length(38).scale(0).create();
+        assertThat(OpenLogReplicatorTableReconciler.isCompatible(integer, schemaColumn(number(-1, 0)))).isTrue();
+        // LONG RAW over JDBC: column size 0
+        final Column longRaw = Column.editor().name("C").jdbcType(OracleTypes.LONGVARBINARY).type("LONG RAW").length(0).create();
         assertThat(OpenLogReplicatorTableReconciler.isCompatible(longRaw, schemaColumn(plain("long raw")))).isTrue();
         assertThat(OpenLogReplicatorTableReconciler.isCompatible(longRaw, schemaColumn(plain("blob")))).isFalse();
     }
@@ -295,8 +298,10 @@ public class OpenLogReplicatorTableReconcilerTest {
                 Arguments.of("XMLTYPE", plain("unknown")),
                 Arguments.of("NCLOB", plain("clob")),
                 Arguments.of("LONG", plain("long")),
+                Arguments.of("LONG RAW", plain("long raw")),
                 Arguments.of("UROWID", sized("urowid", 4000)),
                 Arguments.of("INTERVAL YEAR (4) TO MONTH", sized("interval year to month", 5)),
+                Arguments.of("ROWID", plain("unknown")),
                 Arguments.of("SDO_GEOMETRY", plain("unknown")),
                 Arguments.of("JSON", plain("unknown")),
                 Arguments.of("BOOLEAN", plain("unknown")))));
@@ -329,6 +334,56 @@ public class OpenLogReplicatorTableReconcilerTest {
                 "{\"ID\":1,\"C\":null}"), null)).isEqualTo("column C is timestamp length 11 in the change and DATE in the model");
     }
 
+    @Test
+    void shouldNotReloadForLongRawWithoutValue() throws Exception {
+        // OpenLogReplicator's default unknown-type HIDE never sends LONG or LONG RAW values
+        final Table model = parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"C\" LONG RAW");
+        assertThat(model.columnWithName("C").typeName()).isEqualTo("LONG RAW");
+        final AbstractMutationEvent change = change("[" + ID + "," + col("C", plain("long raw")) + "]", "{\"ID\":1}");
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(model, change, null)).isNull();
+        assertThat(OpenLogReplicatorTableReconciler.reconcile(model, null, change, null).changes()).isEmpty();
+    }
+
+    @Test
+    void shouldNotReloadForLongRawWithValue() throws Exception {
+        // a value only arrives without OpenLogReplicator's default unknown-type HIDE; the parsed model fits it
+        final Table model = parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"C\" LONG RAW");
+        final String columns = "[" + ID + "," + col("C", plain("long raw")) + "]";
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(model, change(columns, "{\"ID\":1,\"C\":\"00\"}"), null)).isNull();
+        assertThat(reconcile(model, null, columns, "{\"ID\":1,\"C\":\"00\"}", null).changes()).isEmpty();
+    }
+
+    @Test
+    void shouldFailForLongRawWithValueMissingFromModel() throws Exception {
+        // a model without the column has to build it from the metadata, which does not map LONG RAW
+        final Table model = parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE");
+        assertThatThrownBy(() -> reconcile(model, null, "[" + ID + "," + col("C", plain("long raw")) + "]", "{\"ID\":1,\"C\":\"00\"}", null))
+                .isInstanceOf(UnmappableColumnException.class)
+                .hasMessageContaining("column C of table " + TABLE_ID + " is long raw in the change");
+    }
+
+    /** National character columns and their byte lengths: UTF8 takes 3 bytes per character, AL16UTF16 takes 2. */
+    static Stream<Arguments> nationalCharacterSets() {
+        return Stream.of(
+                Arguments.of("UTF8", 3, 3999),
+                Arguments.of("AL16UTF16", 2, 4000));
+    }
+
+    @ParameterizedTest
+    @MethodSource("nationalCharacterSets")
+    void shouldNotReloadUnchangedNationalColumns(String charset, int bytesPerCharacter, int maxBytes) throws Exception {
+        final int maxCharacters = maxBytes / bytesPerCharacter;
+        final Table model = parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"NV\" NVARCHAR2(10), \"NVMAX\" NVARCHAR2(" + maxCharacters + "), "
+                + "\"NC\" NCHAR(5), \"NCMAX\" NCHAR(" + 2000 / bytesPerCharacter + ")");
+        final AbstractMutationEvent change = change("[" + ID + "," + col("NV", sized("varchar2", 10 * bytesPerCharacter))
+                + "," + col("NVMAX", sized("varchar2", maxCharacters * bytesPerCharacter)) + "," + col("NC", sized("char", 5 * bytesPerCharacter))
+                + "," + col("NCMAX", sized("char", 2000 / bytesPerCharacter * bytesPerCharacter)) + "]",
+                "{\"ID\":1,\"NV\":\"x\",\"NVMAX\":\"x\",\"NC\":\"x\",\"NCMAX\":\"x\"}");
+
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(model, change, null)).as(charset).isNull();
+        assertThat(OpenLogReplicatorTableReconciler.reconcile(model, null, change, null).changes()).as(charset).isEmpty();
+    }
+
     /** Every column of an unchanged table, as DDL and as OpenLogReplicator describes it for an AL32UTF8 database. */
     private static final String[][] UNCHANGED_TABLE = {
             { "\"N\" NUMBER", number(-1, -1) },
@@ -356,7 +411,9 @@ public class OpenLogReplicatorTableReconcilerTest {
             { "\"NCL\" NCLOB", plain("clob") },
             { "\"BL\" BLOB", plain("blob") },
             { "\"X\" XMLTYPE", plain("clob") },
-            { "\"XB\" XMLTYPE", plain("blob") } };
+            { "\"XB\" XMLTYPE", plain("blob") },
+            { "\"RID\" ROWID", plain("unknown") },
+            { "\"LR\" LONG RAW", plain("long raw") } };
 
     @Test
     void shouldNeverReloadUnchangedTable() throws Exception {
@@ -376,20 +433,25 @@ public class OpenLogReplicatorTableReconcilerTest {
         final Table parsed = parseTable(ddl.toString());
         assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(parsed, change, null)).isNull();
         // the same table as a snapshot reads it over JDBC
-        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(asReadOverJdbc(parsed), change, null)).isNull();
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(asReadOverJdbc(parsed, 38), change, null)).isNull();
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(asReadOverJdbc(parsed, 0), change, null)).isNull();
         // and as the reconciler rebuilds it from the metadata
         assertThat(OpenLogReplicatorTableReconciler.reconcile(parsed, null, change, null).changes()).isEmpty();
     }
 
-    /** The JDBC driver's type names and lengths: a NUMBER without precision has length 0, a timestamp has its precision as length. */
-    private static Table asReadOverJdbc(Table parsed) {
+    /**
+     * The JDBC driver's type names and lengths: a NUMBER without precision has length 0, a timestamp has its precision as length.
+     *
+     * @param integerLength the length of an INTEGER or NUMBER(*,s); ojdbc reports 38
+     */
+    private static Table asReadOverJdbc(Table parsed, int integerLength) {
         final TableEditor editor = parsed.edit();
         for (Column column : parsed.columns()) {
             final ColumnEditor jdbc = column.edit();
             switch (column.typeName()) {
                 case "NUMBER":
                     if (column.length() == 38) {
-                        jdbc.length(0);
+                        jdbc.length(column.scale().isPresent() ? integerLength : 0);
                     }
                     break;
                 case "TIMESTAMP":
