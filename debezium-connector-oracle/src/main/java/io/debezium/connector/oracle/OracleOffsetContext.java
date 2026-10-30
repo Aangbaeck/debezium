@@ -28,10 +28,26 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
     public static final String SNAPSHOT_PENDING_TRANSACTIONS_KEY = "snapshot_pending_tx";
     public static final String SNAPSHOT_SCN_KEY = "snapshot_scn";
     public static final String WINDOW_ADVANCE_ENABLED_KEY = "window_advance_enabled";
+    public static final String OLR_COMPLETED_SCN_KEY = "olr_c_scn";
+    public static final String OLR_COMPLETED_SCN_INDEX_KEY = "olr_c_idx";
+    public static final String OLR_COMPLETED_BASE_SCN_KEY = "olr_c_base_scn";
+    public static final String OLR_COMPLETED_EPOCH_KEY = "olr_c_epoch";
 
     private final Schema sourceInfoSchema;
 
     private boolean windowAdvanceEnabled;
+
+    /**
+     * OpenLogReplicator only: the stream position (c_scn, c_idx) through which every message belongs to a
+     * transaction that was emitted completely, or to a checkpoint. Kept apart from the SCN so that the position a
+     * restart reads redo from does not move past a transaction that is still open in the database.
+     * The base SCN is the offset SCN when the position was set, and the epoch identifies the connection
+     * to OpenLogReplicator the position was reached on.
+     */
+    private Scn completedScn;
+    private Long completedScnIndex;
+    private Scn completedBaseScn;
+    private Long completedEpoch;
 
     private final TransactionContext transactionContext;
     private final IncrementalSnapshotContext<TableId> incrementalSnapshotContext;
@@ -103,6 +119,10 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
         private Long transactionSequence;
         private CommitScn commitScn = CommitScn.empty();
         private boolean windowAdvanceEnabled;
+        private Scn completedScn;
+        private Long completedScnIndex;
+        private Scn completedBaseScn;
+        private Long completedEpoch;
 
         public Builder logicalName(OracleConnectorConfig connectorConfig) {
             this.connectorConfig = connectorConfig;
@@ -174,10 +194,25 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
             return this;
         }
 
+        public Builder completedPosition(Scn completedScn, Long completedScnIndex, Scn completedBaseScn, Long completedEpoch) {
+            this.completedScn = completedScn;
+            this.completedScnIndex = completedScnIndex;
+            this.completedBaseScn = completedBaseScn;
+            this.completedEpoch = completedEpoch;
+            return this;
+        }
+
         public OracleOffsetContext build() {
-            return new OracleOffsetContext(connectorConfig, scn, scnIndex, commitScn, lcrPosition, snapshotScn,
+            final OracleOffsetContext context = new OracleOffsetContext(connectorConfig, scn, scnIndex, commitScn, lcrPosition, snapshotScn,
                     snapshotPendingTransactions, snapshot, snapshotCompleted, transactionContext,
                     incrementalSnapshotContext, transactionId, transactionSequence, windowAdvanceEnabled);
+            if (completedScn != null && !completedScn.isNull()) {
+                context.completedScn = completedScn;
+                context.completedScnIndex = completedScnIndex != null ? completedScnIndex : 0L;
+                context.completedBaseScn = completedBaseScn;
+                context.completedEpoch = completedEpoch;
+            }
+            return context;
         }
     }
 
@@ -210,6 +245,16 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
             }
             if (sourceInfo.getScnIndex() != null) {
                 result.put(SourceInfo.SCN_INDEX_KEY, sourceInfo.getScnIndex());
+            }
+            if (completedScn != null) {
+                result.put(OLR_COMPLETED_SCN_KEY, completedScn.toString());
+                result.put(OLR_COMPLETED_SCN_INDEX_KEY, completedScnIndex);
+                if (completedBaseScn != null) {
+                    result.put(OLR_COMPLETED_BASE_SCN_KEY, completedBaseScn.toString());
+                }
+                if (completedEpoch != null) {
+                    result.put(OLR_COMPLETED_EPOCH_KEY, completedEpoch);
+                }
             }
         }
 
@@ -320,6 +365,44 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
         this.windowAdvanceEnabled = true;
     }
 
+    public Scn getCompletedScn() {
+        return completedScn;
+    }
+
+    public Long getCompletedScnIndex() {
+        return completedScnIndex;
+    }
+
+    public Scn getCompletedBaseScn() {
+        return completedBaseScn;
+    }
+
+    public Long getCompletedEpoch() {
+        return completedEpoch;
+    }
+
+    /**
+     * Sets the OpenLogReplicator position through which the stream has been emitted completely,
+     * recording the current offset SCN as its base.
+     *
+     * @param completedScn the c_scn of the position, never {@code null}
+     * @param completedScnIndex the c_idx of the position, never {@code null}
+     * @param epoch the stream numbering the position belongs to
+     */
+    public void setCompletedPosition(Scn completedScn, long completedScnIndex, Long epoch) {
+        this.completedScn = completedScn;
+        this.completedScnIndex = completedScnIndex;
+        this.completedBaseScn = sourceInfo.getScn();
+        this.completedEpoch = epoch;
+    }
+
+    public void clearCompletedPosition() {
+        this.completedScn = null;
+        this.completedScnIndex = null;
+        this.completedBaseScn = null;
+        this.completedEpoch = null;
+    }
+
     public void setTransactionId(String transactionId) {
         sourceInfo.setTransactionId(transactionId);
     }
@@ -401,6 +484,10 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
             if (getTransactionSequence() != null) {
                 sb.append(", txSeq=").append(getTransactionSequence());
             }
+        }
+
+        if (completedScn != null) {
+            sb.append(", olr_c_scn=").append(completedScn).append(", olr_c_idx=").append(completedScnIndex);
         }
 
         sb.append(", commit_scn=").append(sourceInfo.getCommitScn().toLoggableFormat());

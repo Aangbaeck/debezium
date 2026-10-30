@@ -8,6 +8,7 @@ package io.debezium.connector.oracle.olr.client;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketOption;
+import java.net.SocketTimeoutException;
 import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -19,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.UnaryOperator;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -46,11 +48,15 @@ import jdk.net.ExtendedSocketOptions;
 /**
  * An OpenLogReplicator network client that communicates using JSON streaming payloads.
  *
- * <p>The initial handshake is performed while the channel is in blocking mode as it consists of a
- * fixed request and response exchange. Once the server has entered streaming mode, the channel is
- * switched to non-blocking mode and {@link #readEvent()} waits at most {@link #READ_TIMEOUT} for a
- * complete message to arrive before returning {@code null}, buffering any partially received
- * message until the next call.
+ * <p>The channel is connected in blocking mode and switched to non-blocking mode for the handshake
+ * and the stream, so every read waits on a selector with a deadline; a blocking channel has no read
+ * timeout. {@link #readEvent()} waits at most {@link #READ_TIMEOUT} for a complete message to arrive
+ * before returning {@code null}, buffering any partially received message until the next call.
+ *
+ * <p>The answer to INFO must arrive within the configured INFO timeout. OpenLogReplicator serves one
+ * client at a time, and while it still holds the connection of an earlier client that vanished it
+ * accepts a new connection without answering. The answer to START is awaited without a limit, as the
+ * server may load its dictionary before it answers.
  *
  * <p>An interrupt raised while the client is communicating with the server is a request to shut
  * down rather than a network failure. Such an interrupt is handled internally by marking the client
@@ -91,13 +97,19 @@ public class OlrNetworkClient {
     private final Duration keepAliveIdle;
     private final Duration keepAliveInterval;
     private final int keepAliveCount;
+    private final Duration infoTimeout;
     private final ByteBuffer sizeBuffer = ByteBuffer.allocate(MESSAGE_SIZE_LENGTH).order(ByteOrder.LITTLE_ENDIAN);
 
     private SocketChannel channel;
     private Selector selector;
     private ByteBuffer payloadBuffer;
     private volatile boolean disconnected;
+    private final boolean confirmCompletedTransactions;
     private long prevScn;
+    private long confirmedScn = -1;
+    private long confirmedIndex;
+    private boolean continued;
+    private StreamPosition continuedAfter;
 
     /**
      * Create the OpenLogReplicator network client.
@@ -111,6 +123,8 @@ public class OlrNetworkClient {
         this.keepAliveIdle = connectorConfig.getOpenLogReplicatorKeepAliveIdle();
         this.keepAliveInterval = connectorConfig.getOpenLogReplicatorKeepAliveInterval();
         this.keepAliveCount = connectorConfig.getOpenLogReplicatorKeepAliveCount();
+        this.infoTimeout = connectorConfig.getOpenLogReplicatorInfoTimeout();
+        this.confirmCompletedTransactions = connectorConfig.isOpenLogReplicatorConfirmCompletedTransactions();
     }
 
     /**
@@ -121,6 +135,18 @@ public class OlrNetworkClient {
      * @return true if the connection was established, false if the connection failed
      */
     public boolean connect(Scn scn, Long index) {
+        return connectContinuingAfter(scn, confirmed -> new StreamPosition(scn, index != null ? index : 0L));
+    }
+
+    /**
+     * Connect to the OpenLogReplicator process.
+     *
+     * @param scn the system change number a server that has not started yet begins reading redo at
+     * @param continueAfter given the position a server that is already streaming reports as confirmed, or
+     *            {@code null} when it reports none, returns the position to continue after
+     * @return true if the connection was established, false if the connection failed
+     */
+    public boolean connectContinuingAfter(Scn scn, UnaryOperator<StreamPosition> continueAfter) {
         if (scn == null || scn.isNull()) {
             throw new OlrNetworkClientException("Cannot connect and start with a null system change number");
         }
@@ -134,15 +160,14 @@ public class OlrNetworkClient {
                 return false;
             }
 
-            if (!startFrom(scn, index)) {
-                return false;
-            }
-
-            // The handshake completed and the server is streaming, all subsequent reads are
-            // performed without blocking the caller.
+            // Reads wait on the selector with a deadline, from the handshake on
             channel.configureBlocking(false);
             selector = Selector.open();
             channel.register(selector, SelectionKey.OP_READ);
+
+            if (!startFrom(scn, continueAfter)) {
+                return false;
+            }
             connected = true;
             return true;
         }
@@ -278,6 +303,24 @@ public class OlrNetworkClient {
         return event;
     }
 
+    /**
+     * Returns whether the server was already streaming and was asked to continue, rather than to start.
+     *
+     * @return {@code true} after a CONTINUE, {@code false} after a START or before connecting
+     */
+    public boolean isContinued() {
+        return continued;
+    }
+
+    /**
+     * Returns the position the server was asked to continue after.
+     *
+     * @return the position after a CONTINUE, {@code null} after a START or before connecting
+     */
+    public StreamPosition getContinuedAfter() {
+        return continuedAfter;
+    }
+
     public void confirm(Scn scn, Long index) {
         confirm(scn.longValue(), index);
     }
@@ -320,39 +363,57 @@ public class OlrNetworkClient {
         return description.append(": ").append(error.getOriginalMessage()).toString();
     }
 
+    /**
+     * Sends a CONFIRM for the position unless an equal or later one was already confirmed on this
+     * connection, so the confirmed position only moves forward. Without completed transactions
+     * confirmed, only a higher SCN is sent, and never the first on a connection.
+     */
     private void confirm(long newScn, Long index) {
-        if (prevScn != 0 && prevScn < newScn && index != null) {
+        if (!confirmCompletedTransactions) {
+            if (prevScn != 0 && prevScn < newScn && index != null) {
+                LOGGER.debug("Confirming SCN {} with index {}", newScn, index);
+                send(createRequest(RequestCode.CONFIRM).setCScn(newScn).setCIdx(index).build());
+            }
+            prevScn = newScn;
+            return;
+        }
+        if (index == null) {
+            return;
+        }
+        if (newScn > confirmedScn || (newScn == confirmedScn && index > confirmedIndex)) {
             LOGGER.debug("Confirming SCN {} with index {}", newScn, index);
             send(createRequest(RequestCode.CONFIRM).setCScn(newScn).setCIdx(index).build());
+            confirmedScn = newScn;
+            confirmedIndex = index;
         }
-        prevScn = newScn;
     }
 
-    private boolean startFrom(Scn scn, Long index) {
+    private boolean startFrom(Scn scn, UnaryOperator<StreamPosition> continueAfter) {
         // No client-side filter by SCN: OpenLogReplicator sends a transaction on START only when it commits after the
         // start SCN, and on CONTINUE only after (c_scn, c_idx). A transaction open at the start SCN carries rows below it.
-        if (index != null) {
-            LOGGER.info("Streaming will start at SCN {} with index {}.", scn, index);
-        }
-        else {
-            LOGGER.info("Streaming will start at SCN {}.", scn);
-        }
+        LOGGER.info("Streaming will start at SCN {}.", scn);
         send(createRequest(RequestCode.INFO).build());
 
-        RedoResponse response = readResponse();
+        RedoResponse response = readInfoResponse();
         if (response == null) {
             return false;
         }
         else if (response.getCode() == ResponseCode.REPLICATE) {
-            LOGGER.info("OpenLogReplicator has already started, continue from SCN {}", scn);
+            // The server reports the position confirmed in its current run; none is all ones, or 0 when unset
+            final StreamPosition confirmed = response.getCScn() > 0 ? new StreamPosition(Scn.valueOf(response.getCScn()), response.getCIdx()) : null;
+            final StreamPosition position = continueAfter.apply(confirmed);
+            LOGGER.info("OpenLogReplicator has already started, continue from SCN {} index {} (server confirmed {})",
+                    position.scn(), position.index(), confirmed != null ? confirmed.scn() + " index " + confirmed.index() : "nothing");
             // The position a source is continued from is carried by c_scn and c_idx. The system
             // change number on its own says where to begin reading redo, which only applies to
             // starting a source, and is ignored when continuing one. Sending it there leaves the
             // server to continue from whatever it last had confirmed instead, which is as far back
             // as it still holds, so it streams changes that were emitted long ago.
+            continued = true;
+            continuedAfter = position;
             send(createRequest(RequestCode.CONTINUE)
-                    .setCScn(scn.longValue())
-                    .setCIdx(index != null ? index : 0)
+                    .setCScn(position.scn().longValue())
+                    .setCIdx(position.index())
                     .build());
         }
         else if (response.getCode() == ResponseCode.READY) {
@@ -365,7 +426,8 @@ public class OlrNetworkClient {
             return false;
         }
 
-        response = readResponse();
+        // Unbounded: on START the server may load its dictionary before it answers
+        response = readResponse(null);
         if (response == null) {
             return false;
         }
@@ -383,14 +445,36 @@ public class OlrNetworkClient {
     }
 
     /**
-     * Reads a handshake response from the server, while the channel is still in blocking mode.
+     * Reads the answer to INFO, waiting at most the INFO timeout.
      *
      * @return the response, or {@code null} if the client was interrupted awaiting the response
+     * @throws OlrNetworkClientException caused by a {@link SocketTimeoutException} when no answer arrived in time
      */
-    private RedoResponse readResponse() {
-        final ByteBuffer response = read();
-        if (response == null) {
-            return null;
+    private RedoResponse readInfoResponse() {
+        final RedoResponse response = readResponse(infoTimeout);
+        if (response == null && !disconnected) {
+            // The cause is an IOException, so the error handler treats the failure as retriable
+            throw new OlrNetworkClientException("OpenLogReplicator accepted the connection to " + hostName + ":" + port
+                    + " but did not answer the INFO request within " + infoTimeout.toMillis() + " ms. It serves one client at a "
+                    + "time and may still hold the connection of an earlier client that went away; connecting again.",
+                    new SocketTimeoutException("No answer to INFO within " + infoTimeout.toMillis() + " ms"));
+        }
+        return response;
+    }
+
+    /**
+     * Reads a handshake response from the server.
+     *
+     * @param timeout how long to wait, to within {@link #READ_TIMEOUT}, or {@code null} to wait without a limit
+     * @return the response, or {@code null} if the client was interrupted or the timeout elapsed
+     */
+    private RedoResponse readResponse(Duration timeout) {
+        final long start = System.nanoTime();
+        ByteBuffer response;
+        while ((response = read()) == null) {
+            if (disconnected || (timeout != null && System.nanoTime() - start >= timeout.toNanos())) {
+                return null;
+            }
         }
         try {
             return RedoResponse.parseFrom(response.array());
@@ -402,7 +486,7 @@ public class OlrNetworkClient {
 
     /**
      * Reads the next message from the channel, waiting up to {@link #READ_TIMEOUT} for the message
-     * to arrive when the channel is in non-blocking mode.
+     * to arrive.
      *
      * <p>A message that has only partially arrived within that window is retained across calls so
      * that the next read resumes where the previous one left off.
