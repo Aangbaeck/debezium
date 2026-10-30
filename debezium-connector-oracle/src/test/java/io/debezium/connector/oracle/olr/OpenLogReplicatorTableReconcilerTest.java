@@ -32,7 +32,9 @@ import io.debezium.connector.oracle.olr.client.payloads.AbstractMutationEvent;
 import io.debezium.connector.oracle.olr.client.payloads.SchemaColumn;
 import io.debezium.connector.oracle.util.TestHelper;
 import io.debezium.relational.Column;
+import io.debezium.relational.ColumnEditor;
 import io.debezium.relational.Table;
+import io.debezium.relational.TableEditor;
 import io.debezium.relational.TableId;
 import io.debezium.relational.Tables;
 import io.debezium.relational.Tables.ColumnNameFilter;
@@ -153,6 +155,7 @@ public class OpenLogReplicatorTableReconcilerTest {
         final Column mapped = OpenLogReplicatorTableReconciler.toColumn(table(), schemaColumn(number(-1, 2)));
         assertThat(mapped.length()).isEqualTo(38);
         assertThat(mapped.scale()).contains(2);
+        // a parsed NUMBER(*,2) has scale 0 and converts 1.25 to null: replaced by a reload
         assertThat(OpenLogReplicatorTableReconciler.isCompatible(parseColumn("NUMBER(*,2)"), schemaColumn(number(-1, 2)))).isFalse();
     }
 
@@ -190,6 +193,16 @@ public class OpenLogReplicatorTableReconcilerTest {
         assertThat(OpenLogReplicatorTableReconciler.isCompatible(number, schemaColumn(number(-1, -1)))).isTrue();
         assertThat(OpenLogReplicatorTableReconciler.isCompatible(timestamp, schemaColumn(sized("timestamp", 11)))).isTrue();
         assertThat(OpenLogReplicatorTableReconciler.isCompatible(zoned, schemaColumn(sized("timestamp with time zone", 13)))).isTrue();
+        // NUMBER(*,2) over JDBC: no precision, the dictionary's scale
+        final Column numberWithScale = Column.editor().name("C").jdbcType(OracleTypes.NUMBER).type("NUMBER").length(0).scale(2).create();
+        assertThat(OpenLogReplicatorTableReconciler.isCompatible(numberWithScale, schemaColumn(number(-1, 2)))).isTrue();
+        // INTEGER over JDBC: ojdbc reports precision 38
+        final Column integer = Column.editor().name("C").jdbcType(OracleTypes.NUMBER).type("NUMBER").length(38).scale(0).create();
+        assertThat(OpenLogReplicatorTableReconciler.isCompatible(integer, schemaColumn(number(-1, 0)))).isTrue();
+        // LONG RAW over JDBC: column size 0
+        final Column longRaw = Column.editor().name("C").jdbcType(OracleTypes.LONGVARBINARY).type("LONG RAW").length(0).create();
+        assertThat(OpenLogReplicatorTableReconciler.isCompatible(longRaw, schemaColumn(plain("long raw")))).isTrue();
+        assertThat(OpenLogReplicatorTableReconciler.isCompatible(longRaw, schemaColumn(plain("blob")))).isFalse();
     }
 
     @Test
@@ -206,6 +219,261 @@ public class OpenLogReplicatorTableReconcilerTest {
         assertThat(OpenLogReplicatorTableReconciler.isCompatible(parseColumn("DATE"), schemaColumn(sized("timestamp", 11)))).isFalse();
         assertThat(OpenLogReplicatorTableReconciler.isCompatible(parseColumn("RAW(16)"), schemaColumn(sized("raw", 32)))).isFalse();
         assertThat(OpenLogReplicatorTableReconciler.isCompatible(parseColumn("CLOB"), schemaColumn(plain("blob")))).isFalse();
+    }
+
+    /** A model type and OpenLogReplicator's description of a changed column: the model must be reloaded. */
+    static Stream<Arguments> changedTypes() {
+        return Stream.of(
+                Arguments.of("DATE", sized("timestamp", 11)),
+                Arguments.of("DATE", sized("timestamp", 7)),
+                Arguments.of("TIMESTAMP (6)", plain("date")),
+                Arguments.of("TIMESTAMP (0)", sized("timestamp", 11)),
+                Arguments.of("TIMESTAMP (6)", sized("timestamp", 7)),
+                Arguments.of("TIMESTAMP (6)", sized("timestamp with time zone", 13)),
+                Arguments.of("TIMESTAMP (6) WITH TIME ZONE", sized("timestamp with local time zone", 11)),
+                Arguments.of("TIMESTAMP (6) WITH LOCAL TIME ZONE", sized("timestamp", 11)),
+                Arguments.of("VARCHAR2(10)", sized("varchar2", 50)),
+                Arguments.of("VARCHAR2(50)", sized("varchar2", 10)),
+                Arguments.of("VARCHAR2(10 CHAR)", sized("varchar2", 200)),
+                Arguments.of("VARCHAR2(4000)", sized("varchar2", 32767)),
+                Arguments.of("NVARCHAR2(10)", sized("varchar2", 5)),
+                Arguments.of("CHAR(5)", sized("char", 7)),
+                Arguments.of("NCHAR(5)", sized("char", 22)),
+                Arguments.of("VARCHAR2(20)", sized("char", 20)),
+                Arguments.of("CHAR(20)", sized("varchar2", 20)),
+                Arguments.of("VARCHAR2(20)", number(10, 0)),
+                Arguments.of("VARCHAR2(4000)", plain("clob")),
+                Arguments.of("CLOB", sized("varchar2", 4000)),
+                Arguments.of("CLOB", plain("blob")),
+                Arguments.of("BLOB", plain("clob")),
+                Arguments.of("BLOB", sized("raw", 2000)),
+                Arguments.of("RAW(16)", sized("raw", 32)),
+                Arguments.of("RAW(16)", plain("blob")),
+                Arguments.of("XMLTYPE", sized("varchar2", 4000)),
+                Arguments.of("NUMBER(10,0)", sized("varchar2", 20)),
+                Arguments.of("NUMBER(15,3)", number(18, 4)),
+                Arguments.of("NUMBER(10,2)", number(-1, -1)),
+                Arguments.of("NUMBER", number(10, 0)),
+                Arguments.of("NUMBER", number(-1, 0)),
+                Arguments.of("NUMBER(*,0)", number(-1, -1)),
+                Arguments.of("NUMBER(*,2)", number(10, 2)),
+                // OracleDdlParser parses NUMBER(*,2) with scale 0
+                Arguments.of("NUMBER(*,2)", number(-1, 2)),
+                Arguments.of("NUMBER(10,0)", plain("date")),
+                Arguments.of("NUMBER(10,0)", plain("binary_double")),
+                Arguments.of("FLOAT(126)", number(63, -1)),
+                Arguments.of("FLOAT(126)", number(126, 0)),
+                Arguments.of("BINARY_FLOAT", plain("binary_double")),
+                Arguments.of("BINARY_DOUBLE", number(-1, -1)),
+                Arguments.of("INTERVAL YEAR (2) TO MONTH", sized("interval day to second", 11)),
+                Arguments.of("NUMBER(10,0)", plain("unknown")),
+                Arguments.of("DATE", plain("unknown")),
+                Arguments.of("VARCHAR2(10)", plain("unknown")));
+    }
+
+    /** A model type and OpenLogReplicator's description of the same, unchanged column: no reload. */
+    static Stream<Arguments> unchangedTypes() {
+        return Stream.concat(Stream.concat(exactTypes(), sameSchemaTypes()), Stream.concat(unmappableTypes(), Stream.of(
+                Arguments.of("INTEGER", number(-1, 0)),
+                Arguments.of("NUMBER(10)", number(10, 0)),
+                Arguments.of("NUMBER(10,-1)", number(10, -1)),
+                Arguments.of("FLOAT", number(126, -1)),
+                Arguments.of("REAL", number(63, -1)),
+                // the metadata has no fractional precision, only whether there is a fraction
+                Arguments.of("TIMESTAMP (3)", sized("timestamp", 11)),
+                Arguments.of("TIMESTAMP (9) WITH LOCAL TIME ZONE", sized("timestamp with local time zone", 11)),
+                Arguments.of("TIMESTAMP (0) WITH TIME ZONE", sized("timestamp with time zone", 13)),
+                // character lengths in bytes: AL32UTF8 (4), UTF8 (3), AL16UTF16 (2), capped at the type's byte limit
+                Arguments.of("VARCHAR2(10 CHAR)", sized("varchar2", 30)),
+                Arguments.of("VARCHAR2(1500 CHAR)", sized("varchar2", 4000)),
+                Arguments.of("VARCHAR2(4000 CHAR)", sized("varchar2", 4000)),
+                Arguments.of("VARCHAR2(10000 CHAR)", sized("varchar2", 32767)),
+                Arguments.of("VARCHAR2(32767)", sized("varchar2", 32767)),
+                Arguments.of("CHAR(600 CHAR)", sized("char", 2000)),
+                Arguments.of("NVARCHAR2(10)", sized("varchar2", 30)),
+                Arguments.of("NVARCHAR2(2000)", sized("varchar2", 4000)),
+                Arguments.of("NCHAR(1000)", sized("char", 2000)),
+                Arguments.of("XMLTYPE", plain("clob")),
+                Arguments.of("XMLTYPE", plain("blob")),
+                Arguments.of("XMLTYPE", plain("unknown")),
+                Arguments.of("NCLOB", plain("clob")),
+                Arguments.of("LONG", plain("long")),
+                Arguments.of("LONG RAW", plain("long raw")),
+                Arguments.of("UROWID", sized("urowid", 4000)),
+                Arguments.of("INTERVAL YEAR (4) TO MONTH", sized("interval year to month", 5)),
+                Arguments.of("ROWID", plain("unknown")),
+                Arguments.of("SDO_GEOMETRY", plain("unknown")),
+                Arguments.of("JSON", plain("unknown")),
+                Arguments.of("BOOLEAN", plain("unknown")))));
+    }
+
+    @ParameterizedTest
+    @MethodSource("changedTypes")
+    void shouldDetectChangedType(String ddlType, String metadata) throws Exception {
+        final Table model = parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"C\" " + ddlType);
+        assertThat(OpenLogReplicatorTableReconciler.isCompatible(model.columnWithName("C"), schemaColumn(metadata))).isFalse();
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(model, change("[" + ID + "," + col("C", metadata) + "]",
+                "{\"ID\":1,\"C\":\"x\"}"), null)).startsWith("column C is ");
+    }
+
+    @ParameterizedTest
+    @MethodSource("unchangedTypes")
+    void shouldNotReloadUnchangedType(String ddlType, String metadata) throws Exception {
+        final Table model = parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"C\" " + ddlType);
+        assertThat(OpenLogReplicatorTableReconciler.isCompatible(model.columnWithName("C"), schemaColumn(metadata))).isTrue();
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(model, change("[" + ID + "," + col("C", metadata) + "]",
+                "{\"ID\":1,\"C\":\"x\"}"), null)).isNull();
+    }
+
+    @Test
+    void shouldNotCompareTypeOfColumnWithoutValue() throws Exception {
+        final Table model = parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"C\" DATE");
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(model, change("[" + ID + "," + col("C", sized("timestamp", 11)) + "]",
+                "{\"ID\":1}"), null)).isNull();
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(model, change("[" + ID + "," + col("C", sized("timestamp", 11)) + "]",
+                "{\"ID\":1,\"C\":null}"), null)).isEqualTo("column C is timestamp length 11 in the change and DATE in the model");
+    }
+
+    @Test
+    void shouldNotReloadForLongRawWithoutValue() throws Exception {
+        // OpenLogReplicator's default unknown-type HIDE never sends LONG or LONG RAW values
+        final Table model = parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"C\" LONG RAW");
+        assertThat(model.columnWithName("C").typeName()).isEqualTo("LONG RAW");
+        final AbstractMutationEvent change = change("[" + ID + "," + col("C", plain("long raw")) + "]", "{\"ID\":1}");
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(model, change, null)).isNull();
+        assertThat(OpenLogReplicatorTableReconciler.reconcile(model, null, change, null).changes()).isEmpty();
+    }
+
+    @Test
+    void shouldNotReloadForLongRawWithValue() throws Exception {
+        // a value only arrives without OpenLogReplicator's default unknown-type HIDE; the parsed model fits it
+        final Table model = parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"C\" LONG RAW");
+        final String columns = "[" + ID + "," + col("C", plain("long raw")) + "]";
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(model, change(columns, "{\"ID\":1,\"C\":\"00\"}"), null)).isNull();
+        assertThat(reconcile(model, null, columns, "{\"ID\":1,\"C\":\"00\"}", null).changes()).isEmpty();
+    }
+
+    @Test
+    void shouldFailForLongRawWithValueMissingFromModel() throws Exception {
+        // a model without the column has to build it from the metadata, which does not map LONG RAW
+        final Table model = parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE");
+        assertThatThrownBy(() -> reconcile(model, null, "[" + ID + "," + col("C", plain("long raw")) + "]", "{\"ID\":1,\"C\":\"00\"}", null))
+                .isInstanceOf(UnmappableColumnException.class)
+                .hasMessageContaining("column C of table " + TABLE_ID + " is long raw in the change");
+    }
+
+    /** National character columns and their byte lengths: UTF8 takes 3 bytes per character, AL16UTF16 takes 2. */
+    static Stream<Arguments> nationalCharacterSets() {
+        return Stream.of(
+                Arguments.of("UTF8", 3, 3999),
+                Arguments.of("AL16UTF16", 2, 4000));
+    }
+
+    @ParameterizedTest
+    @MethodSource("nationalCharacterSets")
+    void shouldNotReloadUnchangedNationalColumns(String charset, int bytesPerCharacter, int maxBytes) throws Exception {
+        final int maxCharacters = maxBytes / bytesPerCharacter;
+        final Table model = parseTable("\"ID\" NUMBER(10,0) NOT NULL ENABLE, \"NV\" NVARCHAR2(10), \"NVMAX\" NVARCHAR2(" + maxCharacters + "), "
+                + "\"NC\" NCHAR(5), \"NCMAX\" NCHAR(" + 2000 / bytesPerCharacter + ")");
+        final AbstractMutationEvent change = change("[" + ID + "," + col("NV", sized("varchar2", 10 * bytesPerCharacter))
+                + "," + col("NVMAX", sized("varchar2", maxCharacters * bytesPerCharacter)) + "," + col("NC", sized("char", 5 * bytesPerCharacter))
+                + "," + col("NCMAX", sized("char", 2000 / bytesPerCharacter * bytesPerCharacter)) + "]",
+                "{\"ID\":1,\"NV\":\"x\",\"NVMAX\":\"x\",\"NC\":\"x\",\"NCMAX\":\"x\"}");
+
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(model, change, null)).as(charset).isNull();
+        assertThat(OpenLogReplicatorTableReconciler.reconcile(model, null, change, null).changes()).as(charset).isEmpty();
+    }
+
+    /** Every column of an unchanged table, as DDL and as OpenLogReplicator describes it for an AL32UTF8 database. */
+    private static final String[][] UNCHANGED_TABLE = {
+            { "\"N\" NUMBER", number(-1, -1) },
+            { "\"NP\" NUMBER(15,3)", number(15, 3) },
+            { "\"NI\" INTEGER", number(-1, 0) },
+            { "\"NN\" NUMBER(10,-2)", number(10, -2) },
+            { "\"F\" FLOAT(126)", number(126, -1) },
+            { "\"BF\" BINARY_FLOAT", plain("binary_float") },
+            { "\"BD\" BINARY_DOUBLE", plain("binary_double") },
+            { "\"V\" VARCHAR2(40 BYTE)", sized("varchar2", 40) },
+            { "\"VC\" VARCHAR2(40 CHAR)", sized("varchar2", 160) },
+            { "\"NV\" NVARCHAR2(20)", sized("varchar2", 40) },
+            { "\"C\" CHAR(5 BYTE)", sized("char", 5) },
+            { "\"CC\" CHAR(5 CHAR)", sized("char", 20) },
+            { "\"NC\" NCHAR(5)", sized("char", 10) },
+            { "\"D\" DATE", plain("date") },
+            { "\"T0\" TIMESTAMP (0)", sized("timestamp", 7) },
+            { "\"T6\" TIMESTAMP (6)", sized("timestamp", 11) },
+            { "\"TZ\" TIMESTAMP (6) WITH TIME ZONE", sized("timestamp with time zone", 13) },
+            { "\"LTZ\" TIMESTAMP (3) WITH LOCAL TIME ZONE", sized("timestamp with local time zone", 11) },
+            { "\"YM\" INTERVAL YEAR (2) TO MONTH", sized("interval year to month", 5) },
+            { "\"DS\" INTERVAL DAY (3) TO SECOND (6)", sized("interval day to second", 11) },
+            { "\"R\" RAW(16)", sized("raw", 16) },
+            { "\"CL\" CLOB", plain("clob") },
+            { "\"NCL\" NCLOB", plain("clob") },
+            { "\"BL\" BLOB", plain("blob") },
+            { "\"X\" XMLTYPE", plain("clob") },
+            { "\"XB\" XMLTYPE", plain("blob") },
+            { "\"RID\" ROWID", plain("unknown") },
+            { "\"LR\" LONG RAW", plain("long raw") } };
+
+    @Test
+    void shouldNeverReloadUnchangedTable() throws Exception {
+        final StringBuilder ddl = new StringBuilder("\"ID\" NUMBER(10,0) NOT NULL ENABLE");
+        final StringBuilder columns = new StringBuilder("[" + ID);
+        final StringBuilder values = new StringBuilder("{\"ID\":1");
+        for (String[] column : UNCHANGED_TABLE) {
+            final String name = column[0].substring(1, column[0].indexOf('"', 1));
+            ddl.append(", ").append(column[0]);
+            columns.append(',').append(col(name, column[1]));
+            values.append(",\"").append(name).append("\":\"x\"");
+        }
+        // hidden, guard and unused columns have no value
+        columns.append(',').append(col("SYS_NC00031$", sized("raw", 16))).append(',').append(col("SYS_C00032_26103016:01:02$", plain("date"))).append(']');
+        final AbstractMutationEvent change = change(columns.toString(), values.append('}').toString());
+
+        final Table parsed = parseTable(ddl.toString());
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(parsed, change, null)).isNull();
+        // the same table as a snapshot reads it over JDBC
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(asReadOverJdbc(parsed, 38), change, null)).isNull();
+        assertThat(OpenLogReplicatorStreamingChangeEventSource.findModelMismatch(asReadOverJdbc(parsed, 0), change, null)).isNull();
+        // and as the reconciler rebuilds it from the metadata
+        assertThat(OpenLogReplicatorTableReconciler.reconcile(parsed, null, change, null).changes()).isEmpty();
+    }
+
+    /**
+     * The JDBC driver's type names and lengths: a NUMBER without precision has length 0, a timestamp has its precision as length.
+     *
+     * @param integerLength the length of an INTEGER or NUMBER(*,s); ojdbc reports 38
+     */
+    private static Table asReadOverJdbc(Table parsed, int integerLength) {
+        final TableEditor editor = parsed.edit();
+        for (Column column : parsed.columns()) {
+            final ColumnEditor jdbc = column.edit();
+            switch (column.typeName()) {
+                case "NUMBER":
+                    if (column.length() == 38) {
+                        jdbc.length(column.scale().isPresent() ? integerLength : 0);
+                    }
+                    break;
+                case "TIMESTAMP":
+                case "TIMESTAMP WITH TIME ZONE":
+                case "TIMESTAMP WITH LOCAL TIME ZONE":
+                    jdbc.type(column.typeName().replace("TIMESTAMP", "TIMESTAMP(" + column.length() + ")"));
+                    break;
+                case "INTERVAL YEAR TO MONTH":
+                    jdbc.type("INTERVAL YEAR(" + column.length() + ") TO MONTH");
+                    break;
+                case "INTERVAL DAY TO SECOND":
+                    jdbc.type("INTERVAL DAY(" + column.length() + ") TO SECOND(" + column.scale().orElse(6) + ")");
+                    break;
+                case "XMLTYPE":
+                    jdbc.type("SYS.XMLTYPE");
+                    break;
+                default:
+                    break;
+            }
+            editor.addColumn(jdbc.create());
+        }
+        return editor.create();
     }
 
     @Test
@@ -359,6 +627,12 @@ public class OpenLogReplicatorTableReconcilerTest {
         final StreamingEvent event = mapper.readValue("{\"scn\":1,\"tm\":0,\"c_scn\":1,\"c_idx\":1,\"xid\":\"x\",\"db\":\"S1\",\"payload\":[{\"op\":\"c\","
                 + "\"schema\":{\"owner\":\"DEBEZIUM\",\"table\":\"T\",\"obj\":7,\"columns\":" + columns + "},\"after\":" + after + "}]}", StreamingEvent.class);
         return OpenLogReplicatorTableReconciler.reconcile(base, lastKnown, (AbstractMutationEvent) event.getPayload().get(0), filter);
+    }
+
+    private AbstractMutationEvent change(String columns, String after) throws Exception {
+        final StreamingEvent event = mapper.readValue("{\"scn\":1,\"tm\":0,\"c_scn\":1,\"c_idx\":1,\"xid\":\"x\",\"db\":\"S1\",\"payload\":[{\"op\":\"c\","
+                + "\"schema\":{\"owner\":\"DEBEZIUM\",\"table\":\"T\",\"obj\":7,\"columns\":" + columns + "},\"after\":" + after + "}]}", StreamingEvent.class);
+        return (AbstractMutationEvent) event.getPayload().get(0);
     }
 
     private SchemaColumn schemaColumn(String metadata) throws Exception {

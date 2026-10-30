@@ -9,6 +9,7 @@ import java.sql.SQLException;
 import java.sql.Types;
 import java.time.Instant;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -85,6 +86,7 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
     private final SnapshotterService snapshotterService;
     private final OffsetActivityMonitorService offsetActivityMonitorService;
     private final boolean confirmCompletedTransactions;
+    private final Map<TableId, OpenLogReplicatorTableReconciler.ModelIndex> modelIndexes = new HashMap<>();
 
     private OlrNetworkClient client;
     private OraclePartition partition;
@@ -658,7 +660,7 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
      */
     private Table refreshTableIfStale(StreamingEvent event, AbstractMutationEvent mutationEvent, Table table) throws Exception {
         final ColumnNameFilter columnFilter = connectorConfig.getColumnFilter();
-        final String mismatch = findModelMismatch(table, mutationEvent, columnFilter);
+        final String mismatch = findModelMismatch(modelIndex(table), mutationEvent, columnFilter);
         if (mismatch == null) {
             return table;
         }
@@ -749,47 +751,64 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
     /**
      * Compares a change with the model of its table.
      *
-     * <p>A value for a column the model does not have, or a {@code NUMBER} column of the model that has another
-     * type, precision or scale in the change, means the model describes another version of the table. Columns in the
-     * change's schema but not among its values are hidden, unused or guard columns, which the model never has.
+     * <p>A value for a column the model does not have, or a value for a column whose type in the change does not fit
+     * the model's ({@link OpenLogReplicatorTableReconciler#isCompatible}), means the model describes another version of
+     * the table. Columns in the change's schema but not among its values are hidden, unused or guard columns, which the
+     * model never has, or columns whose type does not matter for this change.
      *
      * @return a description of the first difference, or {@code null} if the change fits the model
      */
     static String findModelMismatch(Table table, AbstractMutationEvent mutationEvent, ColumnNameFilter columnFilter) {
-        final TableId tableId = table.id();
-        for (Values values : new Values[]{ mutationEvent.getBefore(), mutationEvent.getAfter() }) {
-            if (values == null) {
-                continue;
-            }
-            for (String name : values.getValues().keySet()) {
-                if (table.columnWithName(name) == null
-                        && (columnFilter == null || columnFilter.matches(tableId.catalog(), tableId.schema(), tableId.table(), name))) {
-                    return "column " + name + " is not in the model";
-                }
-            }
+        return findModelMismatch(new OpenLogReplicatorTableReconciler.ModelIndex(table), mutationEvent, columnFilter);
+    }
+
+    static String findModelMismatch(OpenLogReplicatorTableReconciler.ModelIndex model, AbstractMutationEvent mutationEvent, ColumnNameFilter columnFilter) {
+        final Map<String, Object> before = mutationEvent.getBefore() == null ? null : mutationEvent.getBefore().getValues();
+        final Map<String, Object> after = mutationEvent.getAfter() == null ? null : mutationEvent.getAfter().getValues();
+        String missing = findColumnNotInModel(model, before, columnFilter);
+        if (missing != null || (missing = findColumnNotInModel(model, after, columnFilter)) != null) {
+            return "column " + missing + " is not in the model";
         }
 
         final List<SchemaColumn> schemaColumns = mutationEvent.getSchema().getColumns();
         if (schemaColumns != null) {
             for (SchemaColumn schemaColumn : schemaColumns) {
-                final Column column = table.columnWithName(schemaColumn.getName());
-                if (column == null || !"NUMBER".equalsIgnoreCase(column.typeName())) {
+                final String name = schemaColumn.getName();
+                final OpenLogReplicatorTableReconciler.IndexedColumn indexed = model.column(name);
+                if (indexed == null || !((before != null && before.containsKey(name)) || (after != null && after.containsKey(name)))) {
                     continue;
                 }
-                if (!"number".equalsIgnoreCase(schemaColumn.getType())) {
-                    return String.format("column %s is %s in the change and NUMBER in the model", column.name(), schemaColumn.getType());
-                }
-                if (schemaColumn.getPrecision() == null || schemaColumn.getPrecision() <= 0 || schemaColumn.getScale() == null
-                        || column.length() <= 0) {
-                    continue;
-                }
-                if (column.length() != schemaColumn.getPrecision() || column.scale().orElse(0) != schemaColumn.getScale().intValue()) {
-                    return String.format("column %s is NUMBER(%d,%d) in the change and NUMBER(%d,%d) in the model",
-                            column.name(), schemaColumn.getPrecision(), schemaColumn.getScale(), column.length(), column.scale().orElse(0));
+                if (!OpenLogReplicatorTableReconciler.isCompatible(indexed.column(), indexed.typeName(), schemaColumn)) {
+                    return String.format("column %s is %s in the change and %s in the model", name,
+                            OpenLogReplicatorTableReconciler.describe(schemaColumn), OpenLogReplicatorTableReconciler.describe(indexed.column()));
                 }
             }
         }
         return null;
+    }
+
+    private static String findColumnNotInModel(OpenLogReplicatorTableReconciler.ModelIndex model, Map<String, Object> values, ColumnNameFilter columnFilter) {
+        if (values == null) {
+            return null;
+        }
+        final TableId tableId = model.table().id();
+        for (String name : values.keySet()) {
+            if (model.column(name) == null && model.table().columnWithName(name) == null
+                    && (columnFilter == null || columnFilter.matches(tableId.catalog(), tableId.schema(), tableId.table(), name))) {
+                return name;
+            }
+        }
+        return null;
+    }
+
+    /** The index of a table's current model, rebuilt when the model instance changes. */
+    private OpenLogReplicatorTableReconciler.ModelIndex modelIndex(Table table) {
+        OpenLogReplicatorTableReconciler.ModelIndex index = modelIndexes.get(table.id());
+        if (index == null || index.table() != table) {
+            index = new OpenLogReplicatorTableReconciler.ModelIndex(table);
+            modelIndexes.put(table.id(), index);
+        }
+        return index;
     }
 
     /**
