@@ -37,6 +37,7 @@ import io.debezium.connector.oracle.olr.client.StreamingEvent;
 import io.debezium.connector.oracle.olr.client.payloads.AbstractMutationEvent;
 import io.debezium.connector.oracle.olr.client.payloads.PayloadSchema;
 import io.debezium.connector.oracle.olr.client.payloads.SchemaChangeEvent;
+import io.debezium.connector.oracle.olr.client.payloads.SchemaColumn;
 import io.debezium.connector.oracle.olr.client.payloads.Values;
 import io.debezium.data.Envelope.Operation;
 import io.debezium.pipeline.ErrorHandler;
@@ -49,6 +50,7 @@ import io.debezium.pipeline.txmetadata.TransactionContext;
 import io.debezium.relational.Column;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
+import io.debezium.relational.Tables.ColumnNameFilter;
 import io.debezium.snapshot.SnapshotterService;
 import io.debezium.util.Clock;
 
@@ -485,6 +487,9 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
             }
             table = result.get();
         }
+        else {
+            table = refreshTableIfStale(event, mutationEvent, table);
+        }
 
         final Operation operation;
         switch (eventType) {
@@ -632,24 +637,94 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
         return results;
     }
 
-    private Optional<Table> potentiallyEmitSchemaChangeForUnknownTable(Type eventType, TableId tableId) throws Exception {
-        if (!connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
-            LOGGER.trace("{} for non-captured table {} detected.", eventType, tableId);
-            return Optional.empty();
+    /**
+     * Reloads the table's model from the database when the change does not fit it, which happens when the
+     * table was replaced under the same name without a DDL for it, as {@code DBMS_REDEFINITION} does.
+     *
+     * @return the model to emit the change with
+     * @throws DebeziumException if the reloaded model does not fit the change either
+     */
+    private Table refreshTableIfStale(StreamingEvent event, AbstractMutationEvent mutationEvent, Table table) throws Exception {
+        final String mismatch = findModelMismatch(table, mutationEvent, connectorConfig.getColumnFilter());
+        if (mismatch == null) {
+            return table;
         }
 
-        LOGGER.warn("Fetching schema for table {}, which should already be loaded. " +
-                "This may indicate a potential error in your configuration.", tableId);
-        final String tableDdl;
-        try {
-            tableDdl = connectionFactory.mainConnection().getTableMetadataDdl(tableId);
+        final TableId tableId = table.id();
+        LOGGER.warn("The model of table {} does not match the change at SCN {} index {}: {}. Reloading it from the database.",
+                tableId, event.getCheckpointScn(), event.getCheckpointIndex(), mismatch);
+
+        // Positioned just before the change: a restart from an earlier transaction does not apply the new
+        // model to the changes before it, and the record's offset does not mark the change as emitted.
+        offsetContext.setScn(event.getCheckpointScn());
+        offsetContext.setScnIndex(event.getCheckpointIndex() == null ? null : event.getCheckpointIndex() - 1);
+        offsetContext.setEventScn(event.getCheckpointScn());
+        offsetContext.setTransactionId(event.getXid());
+
+        // The DDL parser ignores CREATE TABLE for a table it already has
+        schema.getTables().removeTable(tableId);
+        dispatchTableSchemaFromDatabase(tableId);
+
+        final Table refreshed = schema.tableFor(tableId);
+        final String remaining = refreshed == null ? "the table is not in the database"
+                : findModelMismatch(refreshed, mutationEvent, connectorConfig.getColumnFilter());
+        if (remaining != null) {
+            throw new DebeziumException(String.format(
+                    "The model of table %s reloaded from the database does not match the change at SCN %s index %s either: %s. "
+                            + "The table changed again after this change was written.",
+                    tableId, event.getCheckpointScn(), event.getCheckpointIndex(), remaining));
         }
-        catch (NonRelationalTableException e) {
-            LOGGER.warn("{} The event will be skipped.", e.getMessage());
-            streamingMetrics.incrementWarningCount();
-            return Optional.empty();
+        return refreshed;
+    }
+
+    /**
+     * Compares a change with the model of its table.
+     *
+     * <p>A value for a column the model does not have, or a {@code NUMBER} column of the model that has another
+     * type, precision or scale in the change, means the model describes another version of the table. Columns in the
+     * change's schema but not among its values are hidden, unused or guard columns, which the model never has.
+     *
+     * @return a description of the first difference, or {@code null} if the change fits the model
+     */
+    static String findModelMismatch(Table table, AbstractMutationEvent mutationEvent, ColumnNameFilter columnFilter) {
+        final TableId tableId = table.id();
+        for (Values values : new Values[]{ mutationEvent.getBefore(), mutationEvent.getAfter() }) {
+            if (values == null) {
+                continue;
+            }
+            for (String name : values.getValues().keySet()) {
+                if (table.columnWithName(name) == null
+                        && (columnFilter == null || columnFilter.matches(tableId.catalog(), tableId.schema(), tableId.table(), name))) {
+                    return "column " + name + " is not in the model";
+                }
+            }
         }
 
+        final List<SchemaColumn> schemaColumns = mutationEvent.getSchema().getColumns();
+        if (schemaColumns != null) {
+            for (SchemaColumn schemaColumn : schemaColumns) {
+                final Column column = table.columnWithName(schemaColumn.getName());
+                if (column == null || !"NUMBER".equalsIgnoreCase(column.typeName())) {
+                    continue;
+                }
+                if (!"number".equalsIgnoreCase(schemaColumn.getType())) {
+                    return String.format("column %s is %s in the change and NUMBER in the model", column.name(), schemaColumn.getType());
+                }
+                if (schemaColumn.getPrecision() == null || schemaColumn.getPrecision() <= 0 || schemaColumn.getScale() == null
+                        || column.length() <= 0) {
+                    continue;
+                }
+                if (column.length() != schemaColumn.getPrecision() || column.scale().orElse(0) != schemaColumn.getScale().intValue()) {
+                    return String.format("column %s is NUMBER(%d,%d) in the change and NUMBER(%d,%d) in the model",
+                            column.name(), schemaColumn.getPrecision(), schemaColumn.getScale(), column.length(), column.scale().orElse(0));
+                }
+            }
+        }
+        return null;
+    }
+
+    private void dispatchTableSchemaFromDatabase(TableId tableId) throws Exception {
+        final String tableDdl = connectionFactory.mainConnection().getTableMetadataDdl(tableId);
         dispatcher.dispatchSchemaChangeEvent(
                 partition,
                 offsetContext,
@@ -666,6 +741,24 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
                         Instant.now(),
                         streamingMetrics,
                         null));
+    }
+
+    private Optional<Table> potentiallyEmitSchemaChangeForUnknownTable(Type eventType, TableId tableId) throws Exception {
+        if (!connectorConfig.getTableFilters().dataCollectionFilter().isIncluded(tableId)) {
+            LOGGER.trace("{} for non-captured table {} detected.", eventType, tableId);
+            return Optional.empty();
+        }
+
+        LOGGER.warn("Fetching schema for table {}, which should already be loaded. " +
+                "This may indicate a potential error in your configuration.", tableId);
+        try {
+            dispatchTableSchemaFromDatabase(tableId);
+        }
+        catch (NonRelationalTableException e) {
+            LOGGER.warn("{} The event will be skipped.", e.getMessage());
+            streamingMetrics.incrementWarningCount();
+            return Optional.empty();
+        }
 
         return Optional.ofNullable(schema.tableFor(tableId));
     }
