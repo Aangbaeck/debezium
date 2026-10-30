@@ -693,8 +693,8 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
             .withDescription("How long an offset commit waits for the offset Kafka Connect has flushed to be read back from "
                     + "offset storage, in milliseconds (1 to 2147483647). The connector confirms that offset to OpenLogReplicator. The read "
                     + "runs on a thread of its own; when it takes longer, the commit confirms nothing, logs a warning and "
-                    + "streaming goes on. A read still running is not started again, and its result is confirmed at the next "
-                    + "commit after it completes. Defaults to 10000.");
+                    + "streaming goes on. A read still running is not started again; once it completes, a later commit confirms "
+                    + "its result, or the result of a newer read. Defaults to 10000.");
 
     public static final Field OLR_CONFIRM_COMPLETED_TRANSACTIONS = Field.create("openlogreplicator.confirm.completed.transactions")
             .withDisplayName("Confirm and continue past completed transactions with OpenLogReplicator")

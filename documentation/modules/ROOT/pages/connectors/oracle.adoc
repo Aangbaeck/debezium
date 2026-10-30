@@ -6261,7 +6261,7 @@ OpenLogReplicator 2.0.0 stamps messages with the transaction's begin SCN and sen
 Disabling the option after it was enabled is safe but not silent.
 OpenLogReplicator has already released the messages up to the position the connector confirmed, while the connector now continues from the start of the SCN in its offset, which lies before that position.
 OpenLogReplicator logs warning 60039 for the CONTINUE and sends what it still holds; the released messages had already been emitted, so no change is lost.
-With `continue-gap: 1` in its writer configuration, OpenLogReplicator refuses the CONTINUE instead, and the connector does not stream until OpenLogReplicator restarts.
+With `continue-gap: 1` in its writer configuration, OpenLogReplicator refuses the CONTINUE instead, and the connector task stays `RUNNING` without streaming: restart OpenLogReplicator, then restart the connector task.
 To avoid both, stop the connector, restart OpenLogReplicator, then disable the option and resume the connector: an OpenLogReplicator that restarted while no client was connected has confirmed nothing in its run, so there is nothing to continue before.
 
 |[[oracle-property-openlogreplicator-info-timeout-ms]]<<oracle-property-openlogreplicator-info-timeout-ms, `+openlogreplicator.info.timeout.ms+`>>
@@ -6269,7 +6269,7 @@ To avoid both, stop the connector, restart OpenLogReplicator, then disable the o
 |How long the connector waits for OpenLogReplicator to answer the INFO request that opens a connection, in milliseconds (`1` to `2147483647`).
 OpenLogReplicator serves one client at a time.
 While it still holds the connection of an earlier client that went away without closing it, for example a Kafka Connect worker whose network vanished, the operating system accepts a new connection but OpenLogReplicator does not read it until it has dropped the old one.
-The connector then fails with a retriable error that names this cause and connects again after `retriable.restart.connector.wait.ms`, so the wait shows in the log and the task restarts until OpenLogReplicator answers.
+The connector then fails with a retriable error that names this cause and connects again after `retriable.restart.connector.wait.ms`, so the wait shows in the log and the task restarts until OpenLogReplicator answers, as long as `errors.max.retries` allows it (the retry count only resets once records arrive).
 The answer to the START request that follows is awaited without a limit, because OpenLogReplicator may load its dictionary before it answers.
 
 |[[oracle-property-openlogreplicator-flushed-offset-read-timeout-ms]]<<oracle-property-openlogreplicator-flushed-offset-read-timeout-ms, `+openlogreplicator.flushed.offset.read.timeout.ms+`>>
@@ -6277,7 +6277,7 @@ The answer to the START request that follows is awaited without a limit, because
 |How long an offset commit waits for the offset that Kafka Connect has flushed to be read back from offset storage, in milliseconds (`1` to `2147483647`).
 The connector confirms that offset, not the offset of the last record Kafka acknowledged, to OpenLogReplicator.
 The read runs on a thread of its own because the commit runs in the task's poll loop; when it takes longer, the connector logs a warning, confirms nothing at that commit and keeps streaming.
-A read that is still running is not started again, and its result is confirmed at the first commit after it completes.
+A read that is still running is not started again; once it completes, a later commit confirms its result, or the result of a newer read if that one completes in time.
 While no offset can be read, OpenLogReplicator keeps its messages, and its queue can fill up.
 
 |===
