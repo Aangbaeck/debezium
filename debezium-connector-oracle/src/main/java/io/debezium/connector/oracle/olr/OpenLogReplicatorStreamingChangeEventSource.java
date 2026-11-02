@@ -117,8 +117,15 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
     private Long replayScnIndex;
     private String replayTransactionId;
     /**
+     * Changes of other transactions at the replay SCN discarded by position since the replay was armed or last
+     * reported, with {@code openlogreplicator.confirm.within.transactions}.
+     */
+    private long replaySkippedOtherTransactions;
+    /**
      * Whether the replay discarded a change since the last CONFIRM, so the server may hold resent
-     * messages up to the confirmed position that the last CONFIRM did not release.
+     * messages up to the confirmed position that the last CONFIRM did not release. An OpenLogReplicator
+     * that keeps the confirmed position for messages it reads later never holds them; one that releases
+     * only what is queued when the CONFIRM arrives needs the CONFIRM again.
      */
     private final AtomicBoolean discardedSinceConfirm = new AtomicBoolean();
 
@@ -188,16 +195,28 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
                 replayScnIndex = offsetScnIndex;
                 replayTransactionId = offsetContext.getTransactionId();
                 startScnIndex = 0L;
-                LOGGER.info("Replaying transaction {} at SCN {} from its start, skipping through index {}.",
-                        replayTransactionId, replayScn, replayScnIndex);
+                LOGGER.info("Replaying from SCN {}: changes through index {} (transaction {}) were emitted and are discarded.",
+                        replayScn, replayScnIndex, replayTransactionId);
             }
+            replaySkippedOtherTransactions = 0;
             inTransaction = false;
+            // A CONFIRM owed to the previous connection does not apply to this one
+            discardedSinceConfirm.set(false);
 
             final OlrNetworkClient newClient = new OlrNetworkClient(connectorConfig);
             final boolean connected = confirmCompletedTransactions || confirmWithinTransactions
                     ? newClient.connectContinuingAfter(startScn, confirmed -> continuePosition(startScn, confirmed))
                     : newClient.connect(startScn, startScnIndex);
             if (connected) {
+                if (replayScn != null) {
+                    final StreamPosition continuedAfter = newClient.getContinuedAfter();
+                    if (continuedAfter != null) {
+                        LOGGER.info("Server continues after SCN {} index {}.", continuedAfter.scn(), continuedAfter.index());
+                    }
+                    else {
+                        LOGGER.info("Server sends SCN {} from its start.", startScn);
+                    }
+                }
                 if (confirmCompletedTransactions) {
                     onStreamStarted(startScn, newClient.getContinuedAfter());
                 }
@@ -239,6 +258,7 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
             errorHandler.setProducerThrowable(e);
         }
         finally {
+            reportReplaySkips();
             LOGGER.info("Streaming metrics dump: {}", streamingMetrics.toString());
             LOGGER.info("Offsets: {}", offsetContext);
         }
@@ -407,6 +427,7 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
 
         final int comparison = event.getCheckpointScn().compareTo(replayScn);
         if (comparison > 0) {
+            reportReplaySkips();
             LOGGER.info("Replay completed, streaming resumes at SCN {}.", event.getCheckpointScn());
             replayScn = null;
             replayScnIndex = null;
@@ -420,11 +441,34 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
             return true;
         }
 
+        if (confirmWithinTransactions) {
+            // Positions grow along the stream, so a change at or before the offset's position was emitted, whichever
+            // transaction it belongs to. Skipping only the offset's own transaction would emit the end of an earlier
+            // transaction at this SCN again and move the offset back, below what the server has confirmed.
+            if (event.getCheckpointIndex() <= replayScnIndex) {
+                if (!Objects.equals(event.getXid(), replayTransactionId)) {
+                    ++replaySkippedOtherTransactions;
+                }
+                discardedSinceConfirm.set(true);
+                return true;
+            }
+            reportReplaySkips();
+            return false;
+        }
+
         if (Objects.equals(event.getXid(), replayTransactionId) && event.getCheckpointIndex() <= replayScnIndex) {
             discardedSinceConfirm.set(true);
             return true;
         }
         return false;
+    }
+
+    private void reportReplaySkips() {
+        if (replaySkippedOtherTransactions > 0) {
+            LOGGER.info("Replay skipped {} changes of other transactions at SCN {} through index {}, emitted before the restart.",
+                    replaySkippedOtherTransactions, replayScn, replayScnIndex);
+            replaySkippedOtherTransactions = 0;
+        }
     }
 
     void onEvent(StreamingEvent event) throws Exception {

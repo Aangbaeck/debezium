@@ -71,6 +71,7 @@ public class OpenLogReplicatorConfirmWithinTransactionTest {
     private EventDispatcher<OraclePartition, TableId> dispatcher;
     private List<Long> dispatchedIndexes;
     private List<String> startedTransactions;
+    private List<String> committedTransactions;
 
     @BeforeEach
     @SuppressWarnings("unchecked")
@@ -101,6 +102,12 @@ public class OpenLogReplicatorConfirmWithinTransactionTest {
             startedTransactions.add(invocation.getArgument(1) + " restored=" + context.getTransactionId() + " total=" + context.getTotalEventCount());
             return null;
         }).when(dispatcher).dispatchTransactionStartedEvent(any(), any(String.class), any(), any());
+        committedTransactions = new CopyOnWriteArrayList<>();
+        doAnswer(invocation -> {
+            final OracleOffsetContext offset = invocation.getArgument(1);
+            committedTransactions.add(offset.getTransactionContext().getTransactionId() + " total=" + offset.getTransactionContext().getTotalEventCount());
+            return null;
+        }).when(dispatcher).dispatchTransactionCommittedEvent(any(), any(), any());
     }
 
     private static OracleConnectorConfig config(int port, boolean withinTransactions, boolean completedTransactions) {
@@ -314,6 +321,135 @@ public class OpenLogReplicatorConfirmWithinTransactionTest {
             assertThat(olr.requests.subList(2, olr.requests.size()))
                     .extracting(r -> r.getCode() + " " + r.getCScn() + " " + r.getCIdx())
                     .containsExactly("CONFIRM 100 0", "CONFIRM 120 0");
+            olr.close();
+            streaming.thread.join(10_000);
+        }
+    }
+
+    /** An offset stored while OTHER_XID was emitted after XID at the same SCN 100: two rows of it, the last at index 7. */
+    private static Map<String, Object> sharedScnOffset(long index, long rows) {
+        final Map<String, Object> offset = new HashMap<>();
+        offset.put("scn", "100");
+        offset.put("scn_idx", index);
+        offset.put("txId", OTHER_XID);
+        offset.put(TransactionContext.OFFSET_TRANSACTION_ID, OTHER_XID);
+        offset.put("transaction_data_collection_order_S1.DEBEZIUM.CAPTURED", rows);
+        return offset;
+    }
+
+    /** XID at SCN 100 (begin 1, rows 2-3, commit 4), then OTHER_XID at the same SCN (begin 5, rows 6-8, commit 9), resent from after index. */
+    private static List<String> sharedScnMessages(long after) {
+        final List<String> all = List.of(begin(100, 1, XID), row(100, 2, XID), row(100, 3, XID), commit(100, 4, XID),
+                begin(100, 5, OTHER_XID), row(100, 6, OTHER_XID), row(100, 7, OTHER_XID), row(100, 8, OTHER_XID), commit(100, 9, OTHER_XID),
+                begin(120, 1, "0x0001.002.00000005"), row(120, 2, "0x0001.002.00000005"), commit(120, 3, "0x0001.002.00000005"));
+        final List<String> messages = new ArrayList<>();
+        for (int i = 0; i < all.size(); ++i) {
+            final long index = i < 9 ? i + 1 : Long.MAX_VALUE;
+            if (index > after) {
+                messages.add(all.get(i));
+            }
+        }
+        return messages;
+    }
+
+    /**
+     * Two transactions committed at one SCN. The task restarts with its offset in the second one (index 7) while the
+     * server had confirmed only into the first (index 2): the end of the first is resent and is skipped by position,
+     * so it is not emitted twice, the offset does not move back, and the second transaction keeps its counters.
+     */
+    @Test
+    void shouldSkipOtherTransactionAtReplayScnByPosition() throws Exception {
+        try (FakeOlr olr = new FakeOlr(ResponseCode.REPLICATE, new StreamPosition(Scn.valueOf(100), 2L), sharedScnMessages(2))) {
+            final Streaming streaming = stream(olr, config(olr.port(), true, false), sharedScnOffset(7, 2));
+            assertThat(olr.request(1).getCode()).isEqualTo(RequestCode.CONTINUE);
+            assertThat(olr.request(1).getCScn()).isEqualTo(100L);
+            assertThat(olr.request(1).getCIdx()).isEqualTo(2L);
+
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> committedTransactions.size() >= 2);
+            Thread.sleep(200);
+            // XID's row 3 and OTHER_XID's rows 6 and 7 were emitted before the restart
+            assertThat(dispatchedIndexes).containsExactly(8L, 2L);
+            assertThat(startedTransactions).hasSize(2);
+            assertThat(startedTransactions.get(0)).isEqualTo(OTHER_XID + " restored=" + OTHER_XID + " total=2");
+            // no END for XID, whose rows were all skipped; OTHER_XID ends first
+            assertThat(committedTransactions).hasSize(2);
+            assertThat(committedTransactions.get(0)).startsWith(OTHER_XID + " ");
+            olr.close();
+            streaming.thread.join(10_000);
+        }
+
+        // A second restart before the offset passed the boundary: the server confirmed index 7, the offset is at 8
+        dispatchedIndexes.clear();
+        startedTransactions.clear();
+        committedTransactions.clear();
+        try (FakeOlr olr = new FakeOlr(ResponseCode.REPLICATE, new StreamPosition(Scn.valueOf(100), 7L), sharedScnMessages(7))) {
+            final Streaming streaming = stream(olr, config(olr.port(), true, false), sharedScnOffset(8, 3));
+            assertThat(olr.request(1).getCode()).isEqualTo(RequestCode.CONTINUE);
+            assertThat(olr.request(1).getCIdx()).isEqualTo(7L);
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> committedTransactions.size() >= 1);
+            Thread.sleep(200);
+            // row 8 was emitted before; nothing of SCN 100 is emitted again
+            assertThat(dispatchedIndexes).containsExactly(2L);
+            assertThat(committedTransactions).hasSize(1);
+            olr.close();
+            streaming.thread.join(10_000);
+        }
+    }
+
+    /** Without the option the same resend is judged by transaction id and index, as before: XID's rows are emitted again. */
+    @Test
+    void shouldSkipOnlyOwnTransactionAtReplayScnWhenDisabled() throws Exception {
+        try (FakeOlr olr = new FakeOlr(ResponseCode.REPLICATE, new StreamPosition(Scn.valueOf(100), 2L), sharedScnMessages(0))) {
+            final Streaming streaming = stream(olr, config(olr.port(), false, false), sharedScnOffset(7, 2));
+            assertThat(olr.request(1).getCode()).isEqualTo(RequestCode.CONTINUE);
+            assertThat(olr.request(1).getCIdx()).isEqualTo(0L);
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> dispatchedIndexes.size() >= 4);
+            Thread.sleep(200);
+            assertThat(dispatchedIndexes).containsExactly(2L, 3L, 8L, 2L);
+            olr.close();
+            streaming.thread.join(10_000);
+        }
+    }
+
+    /**
+     * Two task restarts inside one transaction on a running server: each continues after what the server confirmed,
+     * discards what was emitted, and the transaction keeps one start and its counters.
+     */
+    @Test
+    void shouldSurviveTwoRestartsInsideOneTransaction() throws Exception {
+        final List<String> first = new ArrayList<>();
+        for (int idx = 4; idx <= 9; ++idx) {
+            first.add(row(100, idx, XID));
+        }
+        try (FakeOlr olr = new FakeOlr(ResponseCode.REPLICATE, new StreamPosition(Scn.valueOf(100), 3L), first)) {
+            final Streaming streaming = stream(olr, config(olr.port(), true, false), midTransactionOffset());
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> dispatchedIndexes.size() >= 2);
+            Thread.sleep(200);
+            assertThat(dispatchedIndexes).containsExactly(8L, 9L);
+            olr.close();
+            streaming.thread.join(10_000);
+        }
+
+        // Flushed through index 8 (4 rows), the server confirmed 6
+        dispatchedIndexes.clear();
+        startedTransactions.clear();
+        final Map<String, Object> second = midTransactionOffset();
+        second.put("scn_idx", 8L);
+        second.put("transaction_data_collection_order_S1.DEBEZIUM.CAPTURED", 4L);
+        final List<String> resent = new ArrayList<>();
+        for (int idx = 7; idx <= 11; ++idx) {
+            resent.add(row(100, idx, XID));
+        }
+        resent.add(commit(100, 12, XID));
+        try (FakeOlr olr = new FakeOlr(ResponseCode.REPLICATE, new StreamPosition(Scn.valueOf(100), 6L), resent)) {
+            final Streaming streaming = stream(olr, config(olr.port(), true, false), second);
+            assertThat(olr.request(1).getCIdx()).isEqualTo(6L);
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> committedTransactions.size() >= 1);
+            Thread.sleep(100);
+            assertThat(dispatchedIndexes).containsExactly(9L, 10L, 11L);
+            assertThat(startedTransactions).containsExactly(XID + " restored=" + XID + " total=4");
+            assertThat(committedTransactions).hasSize(1);
+            assertThat(committedTransactions.get(0)).startsWith(XID + " ");
             olr.close();
             streaming.thread.join(10_000);
         }
