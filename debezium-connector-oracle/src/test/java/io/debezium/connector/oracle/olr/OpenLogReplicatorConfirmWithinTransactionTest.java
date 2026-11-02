@@ -238,11 +238,11 @@ public class OpenLogReplicatorConfirmWithinTransactionTest {
             streaming.source.commitOffset(Map.of(), Map.of("scn", "100", "scn_idx", 9L));
             streaming.source.commitOffset(Map.of(), Map.of("scn", "100", "scn_idx", 9L));
             streaming.source.commitOffset(Map.of(), Map.of("scn", "120", "scn_idx", 2L));
-            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> olr.requests.size() >= 5);
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> olr.requests.size() >= 6);
             Thread.sleep(200);
             assertThat(olr.requests.subList(2, olr.requests.size()))
                     .extracting(r -> r.getCode() + " " + r.getCScn() + " " + r.getCIdx())
-                    .containsExactly("CONFIRM 100 8", "CONFIRM 100 9", "CONFIRM 120 2");
+                    .containsExactly("CONFIRM 100 8", "CONFIRM 100 9", "CONFIRM 100 9", "CONFIRM 120 2");
             olr.close();
             streaming.thread.join(10_000);
         }
@@ -273,10 +273,13 @@ public class OpenLogReplicatorConfirmWithinTransactionTest {
             assertThat(dispatchedIndexes).containsExactly(8L, 9L);
             assertThat(startedTransactions).containsExactly(XID + " restored=" + XID + " total=3");
 
+            // each commit of the unchanged offset confirms it again, releasing what was resent since
             streaming.source.commitOffset(Map.of(), stored);
-            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> olr.requests.size() >= 3);
-            assertThat(olr.request(2).getCode() + " " + olr.request(2).getCScn() + " " + olr.request(2).getCIdx())
-                    .isEqualTo("CONFIRM 100 7");
+            streaming.source.commitOffset(Map.of(), stored);
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> olr.requests.size() >= 4);
+            assertThat(olr.requests.subList(2, olr.requests.size()))
+                    .extracting(r -> r.getCode() + " " + r.getCScn() + " " + r.getCIdx())
+                    .containsExactly("CONFIRM 100 7", "CONFIRM 100 7");
             olr.close();
             streaming.thread.join(10_000);
         }

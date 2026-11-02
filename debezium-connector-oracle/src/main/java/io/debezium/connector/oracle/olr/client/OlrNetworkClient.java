@@ -366,9 +366,12 @@ public class OlrNetworkClient {
     }
 
     /**
-     * Sends a CONFIRM for the position unless an equal or later one was already confirmed on this
-     * connection, so the confirmed position only moves forward. Without completed transactions or
-     * positions inside a transaction confirmed, only a higher SCN is sent, and never the first on a connection.
+     * Sends a CONFIRM for the position unless a later one was already confirmed on this connection, so
+     * the confirmed position never moves back. An equal position is sent again: the server releases only
+     * what is in its queue when the CONFIRM arrives, and after a reconnect it resends messages up to that
+     * position, which the replay discards, possibly after the CONFIRM that covers them; with more of them
+     * than its queue-size the queue would stay full. Without completed transactions or positions inside a
+     * transaction confirmed, only a higher SCN is sent, and never the first on a connection.
      */
     private void confirm(long newScn, Long index) {
         if (!confirmExactPositions) {
@@ -382,7 +385,7 @@ public class OlrNetworkClient {
         if (index == null) {
             return;
         }
-        if (newScn > confirmedScn || (newScn == confirmedScn && index > confirmedIndex)) {
+        if (newScn > confirmedScn || (newScn == confirmedScn && index >= confirmedIndex)) {
             LOGGER.debug("Confirming SCN {} with index {}", newScn, index);
             send(createRequest(RequestCode.CONFIRM).setCScn(newScn).setCIdx(index).build());
             confirmedScn = newScn;
