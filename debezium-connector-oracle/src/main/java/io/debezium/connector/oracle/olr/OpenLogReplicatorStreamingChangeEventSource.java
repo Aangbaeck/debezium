@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import org.slf4j.Logger;
@@ -115,6 +116,11 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
     private Scn replayScn;
     private Long replayScnIndex;
     private String replayTransactionId;
+    /**
+     * Whether the replay discarded a change since the last CONFIRM, so the server may hold resent
+     * messages up to the confirmed position that the last CONFIRM did not release.
+     */
+    private final AtomicBoolean discardedSinceConfirm = new AtomicBoolean();
 
     public OpenLogReplicatorStreamingChangeEventSource(OracleConnectorConfig connectorConfig, OracleConnectionFactory connectionFactory,
                                                        EventDispatcher<OraclePartition, TableId> dispatcher,
@@ -341,7 +347,7 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
         }
 
         final StreamPosition position = confirmPosition(offset);
-        client.confirm(position.scn(), position.index());
+        client.confirm(position.scn(), position.index(), discardedSinceConfirm.getAndSet(false));
     }
 
     /**
@@ -410,11 +416,15 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
 
         if (comparison < 0) {
             // Precedes the transaction being replayed, so it was emitted before the restart.
+            discardedSinceConfirm.set(true);
             return true;
         }
 
-        return Objects.equals(event.getXid(), replayTransactionId)
-                && event.getCheckpointIndex() <= replayScnIndex;
+        if (Objects.equals(event.getXid(), replayTransactionId) && event.getCheckpointIndex() <= replayScnIndex) {
+            discardedSinceConfirm.set(true);
+            return true;
+        }
+        return false;
     }
 
     void onEvent(StreamingEvent event) throws Exception {

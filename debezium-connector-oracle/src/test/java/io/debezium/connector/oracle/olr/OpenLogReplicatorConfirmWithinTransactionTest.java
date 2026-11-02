@@ -64,6 +64,8 @@ public class OpenLogReplicatorConfirmWithinTransactionTest {
 
     private static final String XID = "0x0001.002.00000003";
     private static final String OTHER_XID = "0x0001.002.00000004";
+    /** In the messages of {@link FakeOlr}: wait for the next request before sending the rest. */
+    private static final String AWAIT_REQUEST = "await-request";
 
     private OracleDatabaseSchema schema;
     private EventDispatcher<OraclePartition, TableId> dispatcher;
@@ -238,11 +240,11 @@ public class OpenLogReplicatorConfirmWithinTransactionTest {
             streaming.source.commitOffset(Map.of(), Map.of("scn", "100", "scn_idx", 9L));
             streaming.source.commitOffset(Map.of(), Map.of("scn", "100", "scn_idx", 9L));
             streaming.source.commitOffset(Map.of(), Map.of("scn", "120", "scn_idx", 2L));
-            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> olr.requests.size() >= 6);
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> olr.requests.size() >= 5);
             Thread.sleep(200);
             assertThat(olr.requests.subList(2, olr.requests.size()))
                     .extracting(r -> r.getCode() + " " + r.getCScn() + " " + r.getCIdx())
-                    .containsExactly("CONFIRM 100 8", "CONFIRM 100 9", "CONFIRM 100 9", "CONFIRM 120 2");
+                    .containsExactly("CONFIRM 100 8", "CONFIRM 100 9", "CONFIRM 120 2");
             olr.close();
             streaming.thread.join(10_000);
         }
@@ -257,7 +259,12 @@ public class OpenLogReplicatorConfirmWithinTransactionTest {
     void shouldReplayTransactionFromStartWhenServerStarts() throws Exception {
         final List<String> messages = new ArrayList<>();
         messages.add(begin(100, 1, XID));
-        for (int idx = 2; idx <= 9; ++idx) {
+        for (int idx = 2; idx <= 5; ++idx) {
+            messages.add(row(100, idx, XID));
+        }
+        // the rest of the resent transaction reaches the server's queue after the first CONFIRM
+        messages.add(AWAIT_REQUEST);
+        for (int idx = 6; idx <= 9; ++idx) {
             messages.add(row(100, idx, XID));
         }
         messages.add(commit(100, 10, XID));
@@ -268,15 +275,19 @@ public class OpenLogReplicatorConfirmWithinTransactionTest {
             assertThat(olr.request(1).getCode()).isEqualTo(RequestCode.START);
             assertThat(olr.request(1).getScn()).isEqualTo(100L);
 
+            // rows 2..5 are discarded, then the stored offset is confirmed on the new connection
+            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> {
+                streaming.source.commitOffset(Map.of(), stored);
+                return olr.requests.size() >= 3;
+            });
             Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> dispatchedIndexes.size() >= 2);
-            Thread.sleep(200);
             assertThat(dispatchedIndexes).containsExactly(8L, 9L);
             assertThat(startedTransactions).containsExactly(XID + " restored=" + XID + " total=3");
 
-            // each commit of the unchanged offset confirms it again, releasing what was resent since
+            // rows 6 and 7 were discarded after it: the unchanged offset is confirmed again, once
             streaming.source.commitOffset(Map.of(), stored);
             streaming.source.commitOffset(Map.of(), stored);
-            Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> olr.requests.size() >= 4);
+            Thread.sleep(300);
             assertThat(olr.requests.subList(2, olr.requests.size()))
                     .extracting(r -> r.getCode() + " " + r.getCScn() + " " + r.getCIdx())
                     .containsExactly("CONFIRM 100 7", "CONFIRM 100 7");
@@ -377,7 +388,12 @@ public class OpenLogReplicatorConfirmWithinTransactionTest {
                 requests.add(readRequest(in));
                 write(out, RedoResponse.newBuilder().setCode(ResponseCode.REPLICATE).build().toByteArray());
                 for (String message : messages) {
-                    write(out, message.getBytes(StandardCharsets.UTF_8));
+                    if (AWAIT_REQUEST.equals(message)) {
+                        requests.add(readRequest(in));
+                    }
+                    else {
+                        write(out, message.getBytes(StandardCharsets.UTF_8));
+                    }
                 }
                 while (true) {
                     requests.add(readRequest(in));

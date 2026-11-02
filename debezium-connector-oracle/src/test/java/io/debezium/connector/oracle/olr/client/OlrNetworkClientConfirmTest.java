@@ -57,8 +57,9 @@ public class OlrNetworkClientConfirmTest {
                 client.confirm(Scn.valueOf(120), 3L);
                 client.confirm(Scn.valueOf(120), 5L);
                 client.confirm(Scn.valueOf(120), 5L);
-                client.confirm(Scn.valueOf(120), 0L);
-                client.confirm(Scn.valueOf(110), 9L);
+                client.confirm(Scn.valueOf(120), 5L, true);
+                client.confirm(Scn.valueOf(120), 0L, true);
+                client.confirm(Scn.valueOf(110), 9L, true);
                 client.confirm(Scn.valueOf(130), 0L);
 
                 Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> requests.size() >= 6);
@@ -67,7 +68,7 @@ public class OlrNetworkClientConfirmTest {
                 assertThat(requests.get(1).getCode()).isEqualTo(RequestCode.CONTINUE);
                 assertThat(requests.get(1).getCScn()).isEqualTo(120L);
                 assertThat(requests.get(1).getCIdx()).isEqualTo(3L);
-                // an equal position is sent again, an earlier one never
+                // an equal position only when asked to send it again, an earlier one never
                 assertThat(requests.subList(2, requests.size()))
                         .extracting(r -> r.getCode() + " " + r.getCScn() + " " + r.getCIdx())
                         .containsExactly("CONFIRM 120 3", "CONFIRM 120 5", "CONFIRM 120 5", "CONFIRM 130 0");
