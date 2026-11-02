@@ -105,7 +105,7 @@ public class OlrNetworkClient {
     private Selector selector;
     private ByteBuffer payloadBuffer;
     private volatile boolean disconnected;
-    private final boolean confirmCompletedTransactions;
+    private final boolean confirmExactPositions;
     private long prevScn;
     private long confirmedScn = -1;
     private long confirmedIndex;
@@ -125,7 +125,8 @@ public class OlrNetworkClient {
         this.keepAliveInterval = connectorConfig.getOpenLogReplicatorKeepAliveInterval();
         this.keepAliveCount = connectorConfig.getOpenLogReplicatorKeepAliveCount();
         this.infoTimeout = connectorConfig.getOpenLogReplicatorInfoTimeout();
-        this.confirmCompletedTransactions = connectorConfig.isOpenLogReplicatorConfirmCompletedTransactions();
+        this.confirmExactPositions = connectorConfig.isOpenLogReplicatorConfirmCompletedTransactions()
+                || connectorConfig.isOpenLogReplicatorConfirmWithinTransactions();
     }
 
     /**
@@ -366,11 +367,11 @@ public class OlrNetworkClient {
 
     /**
      * Sends a CONFIRM for the position unless an equal or later one was already confirmed on this
-     * connection, so the confirmed position only moves forward. Without completed transactions
-     * confirmed, only a higher SCN is sent, and never the first on a connection.
+     * connection, so the confirmed position only moves forward. Without completed transactions or
+     * positions inside a transaction confirmed, only a higher SCN is sent, and never the first on a connection.
      */
     private void confirm(long newScn, Long index) {
-        if (!confirmCompletedTransactions) {
+        if (!confirmExactPositions) {
             if (prevScn != 0 && prevScn < newScn && index != null) {
                 LOGGER.debug("Confirming SCN {} with index {}", newScn, index);
                 send(createRequest(RequestCode.CONFIRM).setCScn(newScn).setCIdx(index).build());

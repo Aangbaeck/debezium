@@ -6265,6 +6265,17 @@ With `continue-gap: 1` in its writer configuration, OpenLogReplicator refuses th
 The task fails the same way whenever OpenLogReplicator answers a START or CONTINUE with anything other than `REPLICATE`, for example after the connector offset was rewound or reset.
 To avoid both, stop the connector, restart OpenLogReplicator, then disable the option and resume the connector: an OpenLogReplicator that restarted while no client was connected has confirmed nothing in its run, so there is nothing to continue before.
 
+|[[oracle-property-openlogreplicator-confirm-within-transactions]]<<oracle-property-openlogreplicator-confirm-within-transactions, `+openlogreplicator.confirm.within.transactions+`>>
+|`false`
+|Whether the connector confirms to OpenLogReplicator the position of the last change in its flushed offset, its SCN and `scn_idx`, also in the middle of a transaction, and continues after that position when it reconnects to a running OpenLogReplicator.
+When `false`, the connector confirms the start of the SCN in its offset, so OpenLogReplicator keeps every message of the transaction being emitted until a later SCN is confirmed. A transaction with more messages than the network writer's `queue-size` then fills the queue and streaming stops, with OpenLogReplicator warning 60040.
+When `true`, OpenLogReplicator releases a transaction's messages as their offsets are flushed, so the size of a transaction is no longer bounded by `queue-size` or the writer's output buffer. OpenLogReplicator still holds a transaction in its transaction buffer (`memory.max-mb` and swap) until the transaction commits.
+After a restart in the middle of a transaction, the connector continues after the position OpenLogReplicator reports confirmed, or reads the transaction again from its start when OpenLogReplicator starts anew, and discards the changes up to its offset; transaction metadata continues the counts stored in the offset.
+The option can be combined with `openlogreplicator.confirm.completed.transactions`; the further of the two positions is confirmed.
+
+WARNING: Enable this only with an OpenLogReplicator that stamps every message with its transaction's commit SCN and sends the exact `c_idx` of each message, for example the `ahlsell-group/OpenLogReplicator` fork. With OpenLogReplicator 2.0.0 the connector loses changes.
+Disabling the option after it was enabled has the same effect on the next CONTINUE as disabling `openlogreplicator.confirm.completed.transactions`, and the same remedy applies.
+
 |[[oracle-property-openlogreplicator-info-timeout-ms]]<<oracle-property-openlogreplicator-info-timeout-ms, `+openlogreplicator.info.timeout.ms+`>>
 |`30000` (30 seconds)
 |How long the connector waits for OpenLogReplicator to answer the INFO request that opens a connection, in milliseconds (`1` to `2147483647`).

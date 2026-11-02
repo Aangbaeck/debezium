@@ -40,4 +40,8 @@ public record StreamPosition(Scn scn, long index) {
     public static StreamPosition min(StreamPosition a, StreamPosition b) {
         return a.isAfter(b) ? b : a;
     }
+
+    public static StreamPosition max(StreamPosition a, StreamPosition b) {
+        return a.isAfter(b) ? a : b;
+    }
 }
