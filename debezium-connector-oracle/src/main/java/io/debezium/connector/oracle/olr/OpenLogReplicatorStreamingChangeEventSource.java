@@ -1012,7 +1012,9 @@ public class OpenLogReplicatorStreamingChangeEventSource implements StreamingCha
             }
         }
 
-        offsetContext.setScn(event.getScn());
+        // The stream position, as for every other dispatched change: it is what is confirmed and continued from
+        offsetContext.setScn(event.getCheckpointScn());
+        offsetContext.setScnIndex(event.getCheckpointIndex());
         offsetContext.setEventScn(event.getScn());
         offsetContext.setTransactionId(event.getXid());
         offsetContext.tableEvent(tableId, event.getTimestamp());
