@@ -57,19 +57,21 @@ public class OlrNetworkClientConfirmTest {
                 client.confirm(Scn.valueOf(120), 3L);
                 client.confirm(Scn.valueOf(120), 5L);
                 client.confirm(Scn.valueOf(120), 5L);
-                client.confirm(Scn.valueOf(120), 0L);
-                client.confirm(Scn.valueOf(110), 9L);
+                client.confirm(Scn.valueOf(120), 5L, true);
+                client.confirm(Scn.valueOf(120), 0L, true);
+                client.confirm(Scn.valueOf(110), 9L, true);
                 client.confirm(Scn.valueOf(130), 0L);
 
-                Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> requests.size() >= 5);
+                Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> requests.size() >= 6);
                 Thread.sleep(200);
 
                 assertThat(requests.get(1).getCode()).isEqualTo(RequestCode.CONTINUE);
                 assertThat(requests.get(1).getCScn()).isEqualTo(120L);
                 assertThat(requests.get(1).getCIdx()).isEqualTo(3L);
+                // an equal position only when asked to send it again, an earlier one never
                 assertThat(requests.subList(2, requests.size()))
                         .extracting(r -> r.getCode() + " " + r.getCScn() + " " + r.getCIdx())
-                        .containsExactly("CONFIRM 120 3", "CONFIRM 120 5", "CONFIRM 130 0");
+                        .containsExactly("CONFIRM 120 3", "CONFIRM 120 5", "CONFIRM 120 5", "CONFIRM 130 0");
             }
             finally {
                 client.disconnect();
@@ -134,12 +136,50 @@ public class OlrNetworkClientConfirmTest {
         }
     }
 
+    @Test
+    public void shouldConfirmEveryLaterIndexOfOneScnWhenConfirmingWithinTransactions() throws Exception {
+        final List<RedoRequest> requests = new CopyOnWriteArrayList<>();
+        try (ServerSocket server = new ServerSocket(0)) {
+            final Thread olr = new Thread(() -> serve(server, ResponseCode.REPLICATE, requests));
+            olr.setDaemon(true);
+            olr.start();
+
+            final OlrNetworkClient client = new OlrNetworkClient(config(server, false, true));
+            try {
+                assertThat(client.connectContinuingAfter(Scn.valueOf(100), confirmed -> new StreamPosition(Scn.valueOf(100), 2L))).isTrue();
+                // one transaction at SCN 100 confirmed as it is delivered, the first on the connection included
+                client.confirm(Scn.valueOf(100), 2L);
+                client.confirm(Scn.valueOf(100), 1000L);
+                client.confirm(Scn.valueOf(100), 999L);
+                client.confirm(Scn.valueOf(100), 2000L);
+                client.confirm(Scn.valueOf(130), 1L);
+
+                Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> requests.size() >= 6);
+                Thread.sleep(200);
+
+                assertThat(requests.get(1).getCode()).isEqualTo(RequestCode.CONTINUE);
+                assertThat(requests.get(1).getCIdx()).isEqualTo(2L);
+                assertThat(requests.subList(2, requests.size()))
+                        .extracting(r -> r.getCode() + " " + r.getCScn() + " " + r.getCIdx())
+                        .containsExactly("CONFIRM 100 2", "CONFIRM 100 1000", "CONFIRM 100 2000", "CONFIRM 130 1");
+            }
+            finally {
+                client.disconnect();
+            }
+        }
+    }
+
     private static OracleConnectorConfig config(ServerSocket server, boolean confirmCompletedTransactions) {
+        return config(server, confirmCompletedTransactions, false);
+    }
+
+    private static OracleConnectorConfig config(ServerSocket server, boolean confirmCompletedTransactions, boolean confirmWithinTransactions) {
         return new OracleConnectorConfig(TestHelper.defaultConfig()
                 .with(OracleConnectorConfig.OLR_HOST, "127.0.0.1")
                 .with(OracleConnectorConfig.OLR_PORT, server.getLocalPort())
                 .with(OracleConnectorConfig.OLR_SOURCE, "S1")
                 .with(OracleConnectorConfig.OLR_CONFIRM_COMPLETED_TRANSACTIONS, confirmCompletedTransactions)
+                .with(OracleConnectorConfig.OLR_CONFIRM_WITHIN_TRANSACTIONS, confirmWithinTransactions)
                 .build());
     }
 

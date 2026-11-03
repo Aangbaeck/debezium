@@ -105,7 +105,7 @@ public class OlrNetworkClient {
     private Selector selector;
     private ByteBuffer payloadBuffer;
     private volatile boolean disconnected;
-    private final boolean confirmCompletedTransactions;
+    private final boolean confirmExactPositions;
     private long prevScn;
     private long confirmedScn = -1;
     private long confirmedIndex;
@@ -125,7 +125,8 @@ public class OlrNetworkClient {
         this.keepAliveInterval = connectorConfig.getOpenLogReplicatorKeepAliveInterval();
         this.keepAliveCount = connectorConfig.getOpenLogReplicatorKeepAliveCount();
         this.infoTimeout = connectorConfig.getOpenLogReplicatorInfoTimeout();
-        this.confirmCompletedTransactions = connectorConfig.isOpenLogReplicatorConfirmCompletedTransactions();
+        this.confirmExactPositions = connectorConfig.isOpenLogReplicatorConfirmCompletedTransactions()
+                || connectorConfig.isOpenLogReplicatorConfirmWithinTransactions();
     }
 
     /**
@@ -323,7 +324,16 @@ public class OlrNetworkClient {
     }
 
     public void confirm(Scn scn, Long index) {
-        confirm(scn.longValue(), index);
+        confirm(scn.longValue(), index, false);
+    }
+
+    /**
+     * Confirms the position, with {@code again} also when it equals the position last confirmed.
+     *
+     * @param again whether an equal position is sent again, see {@link #confirm(long, Long, boolean)}
+     */
+    public void confirm(Scn scn, Long index, boolean again) {
+        confirm(scn.longValue(), index, again);
     }
 
     private StreamingEvent readNextEvent() {
@@ -365,12 +375,17 @@ public class OlrNetworkClient {
     }
 
     /**
-     * Sends a CONFIRM for the position unless an equal or later one was already confirmed on this
-     * connection, so the confirmed position only moves forward. Without completed transactions
-     * confirmed, only a higher SCN is sent, and never the first on a connection.
+     * Sends a CONFIRM for the position if it is later than the one last confirmed on this connection, so
+     * the confirmed position never moves back. With {@code again} an equal position is sent too: the
+     * server releases only what is in its queue when the CONFIRM arrives, and after a reconnect it resends
+     * messages up to that position, which the replay discards, possibly after the CONFIRM that covers
+     * them; with more of them than its queue-size the queue would stay full. An equal position is not
+     * sent otherwise, so an idle connection carries no unacknowledged data and TCP keepalive can probe
+     * it. Without completed transactions or positions inside a transaction confirmed, only a higher SCN
+     * is sent, and never the first on a connection.
      */
-    private void confirm(long newScn, Long index) {
-        if (!confirmCompletedTransactions) {
+    private void confirm(long newScn, Long index, boolean again) {
+        if (!confirmExactPositions) {
             if (prevScn != 0 && prevScn < newScn && index != null) {
                 LOGGER.debug("Confirming SCN {} with index {}", newScn, index);
                 send(createRequest(RequestCode.CONFIRM).setCScn(newScn).setCIdx(index).build());
@@ -381,7 +396,7 @@ public class OlrNetworkClient {
         if (index == null) {
             return;
         }
-        if (newScn > confirmedScn || (newScn == confirmedScn && index > confirmedIndex)) {
+        if (newScn > confirmedScn || (newScn == confirmedScn && (index > confirmedIndex || (again && index == confirmedIndex)))) {
             LOGGER.debug("Confirming SCN {} with index {}", newScn, index);
             send(createRequest(RequestCode.CONFIRM).setCScn(newScn).setCIdx(index).build());
             confirmedScn = newScn;

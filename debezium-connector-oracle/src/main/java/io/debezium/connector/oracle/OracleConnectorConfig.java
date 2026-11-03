@@ -708,6 +708,19 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     + "Requires an OpenLogReplicator that stamps messages with the commit SCN and sends exact c_idx values, such as "
                     + "the ahlsell-group fork; with OpenLogReplicator 2.0.0 it loses changes. Defaults to false.");
 
+    public static final Field OLR_CONFIRM_WITHIN_TRANSACTIONS = Field.create("openlogreplicator.confirm.within.transactions")
+            .withDisplayName("Confirm and continue OpenLogReplicator positions inside a transaction")
+            .withType(Type.BOOLEAN)
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.LOW)
+            .withDefault(false)
+            .withDescription("Whether the connector confirms to OpenLogReplicator, and continues after, the position of the last "
+                    + "change in its flushed offset (SCN and index), also inside a transaction, rather than the start of the "
+                    + "offset SCN. Without it, OpenLogReplicator keeps every message of the transaction being emitted, so a "
+                    + "transaction with more messages than its queue-size stops streaming. Requires an OpenLogReplicator that "
+                    + "stamps messages with the commit SCN and sends exact c_idx values, such as the ahlsell-group fork; with "
+                    + "OpenLogReplicator 2.0.0 it loses changes. Defaults to false.");
+
     public static final Field LOG_MINING_SCHEMA_CHANGES_USERNAME_EXCLUDE_LIST = Field.createInternal("log.mining.schema_changes.username.exclude.list")
             .withDisplayName("Username exclusion list for schema changes")
             .withType(Type.STRING)
@@ -927,7 +940,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
                     LOG_MINING_LOG_BACKOFF_MAX_DELAY_MS, LOG_MINING_SESSION_MAX_MS, LOG_MINING_WINDOW_MAX_MS, LOG_MINING_TRANSACTION_SNAPSHOT_BOUNDARY_MODE,
                     LOG_MINING_READ_ONLY, LOG_MINING_FLUSH_TABLE_NAME, LOG_MINING_QUERY_FILTER_MODE, LOG_MINING_RESTART_CONNECTION, LOG_MINING_MAX_SCN_DEVIATION_MS,
                     LOG_MINING_SCHEMA_CHANGES_USERNAME_EXCLUDE_LIST, LOG_MINING_INCLUDE_REDO_SQL, OLR_SOURCE, OLR_HOST, OLR_PORT,
-                    OLR_KEEPALIVE_IDLE_MS, OLR_KEEPALIVE_INTERVAL_MS, OLR_KEEPALIVE_COUNT, OLR_CONFIRM_COMPLETED_TRANSACTIONS,
+                    OLR_KEEPALIVE_IDLE_MS, OLR_KEEPALIVE_INTERVAL_MS, OLR_KEEPALIVE_COUNT, OLR_CONFIRM_COMPLETED_TRANSACTIONS, OLR_CONFIRM_WITHIN_TRANSACTIONS,
                     OLR_INFO_TIMEOUT_MS, OLR_FLUSHED_OFFSET_READ_TIMEOUT_MS,
                     LOG_MINING_BUFFER_EHCACHE_GLOBAL_CONFIG, LOG_MINING_BUFFER_EHCACHE_TRANSACTIONS_CONFIG, LOG_MINING_BUFFER_EHCACHE_PROCESSED_TRANSACTIONS_CONFIG,
                     LOG_MINING_BUFFER_EHCACHE_SCHEMA_CHANGES_CONFIG, LOG_MINING_BUFFER_EHCACHE_EVENTS_CONFIG,
@@ -1030,6 +1043,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
     private final Duration openLogReplicatorKeepAliveInterval;
     private final int openLogReplicatorKeepAliveCount;
     private final boolean openLogReplicatorConfirmCompletedTransactions;
+    private final boolean openLogReplicatorConfirmWithinTransactions;
     private final Duration openLogReplicatorInfoTimeout;
     private final Duration openLogReplicatorFlushedOffsetReadTimeout;
 
@@ -1137,6 +1151,7 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
         this.openLogReplicatorKeepAliveInterval = Duration.ofMillis(config.getLong(OLR_KEEPALIVE_INTERVAL_MS));
         this.openLogReplicatorKeepAliveCount = config.getInteger(OLR_KEEPALIVE_COUNT);
         this.openLogReplicatorConfirmCompletedTransactions = config.getBoolean(OLR_CONFIRM_COMPLETED_TRANSACTIONS);
+        this.openLogReplicatorConfirmWithinTransactions = config.getBoolean(OLR_CONFIRM_WITHIN_TRANSACTIONS);
         this.openLogReplicatorInfoTimeout = Duration.ofMillis(config.getLong(OLR_INFO_TIMEOUT_MS));
         this.openLogReplicatorFlushedOffsetReadTimeout = Duration.ofMillis(config.getLong(OLR_FLUSHED_OFFSET_READ_TIMEOUT_MS));
 
@@ -2215,6 +2230,16 @@ public class OracleConnectorConfig extends HistorizedRelationalDatabaseConnector
      */
     public boolean isOpenLogReplicatorConfirmCompletedTransactions() {
         return openLogReplicatorConfirmCompletedTransactions;
+    }
+
+    /**
+     * Returns whether OpenLogReplicator is confirmed, and continued after, the position of the last
+     * emitted change, also inside a transaction, rather than the start of the offset SCN.
+     *
+     * @return {@code true} if positions inside a transaction are confirmed, {@code false} otherwise
+     */
+    public boolean isOpenLogReplicatorConfirmWithinTransactions() {
+        return openLogReplicatorConfirmWithinTransactions;
     }
 
     /**
