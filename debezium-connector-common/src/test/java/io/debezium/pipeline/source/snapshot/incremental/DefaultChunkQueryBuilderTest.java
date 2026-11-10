@@ -24,6 +24,7 @@ import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.relational.Column;
 import io.debezium.relational.ColumnFilterMode;
+import io.debezium.relational.Key.KeyMapper;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
@@ -594,6 +595,138 @@ public class DefaultChunkQueryBuilderTest {
         assertThatThrownBy(() -> chunkQueryBuilder.buildChunkQuery(context, table, Optional.of("\"val1\"=foo")))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessage("Surrogate key \"sk\" doesn't exist in table \"s1.table1\"");
+    }
+
+    private static final class CountingChunkQueryBuilder extends DefaultChunkQueryBuilder<TableId> {
+        private int keyMapperCalls;
+
+        CountingChunkQueryBuilder(RelationalDatabaseConnectorConfig config) {
+            super(config, new JdbcConnection(config.getJdbcConfig(), c -> null, "\"", "\""));
+        }
+
+        @Override
+        protected KeyMapper getKeyMapper() {
+            final KeyMapper mapper = super.getKeyMapper();
+            return table -> {
+                keyMapperCalls++;
+                return mapper.getKeyKolumns(table);
+            };
+        }
+    }
+
+    private RelationalDatabaseConnectorConfig messageKeyColumnsConfig(String messageKeyColumns) {
+        return buildConfig(Configuration.create()
+                .with(RelationalDatabaseConnectorConfig.SIGNAL_DATA_COLLECTION, "debezium.signal")
+                .with(RelationalDatabaseConnectorConfig.TOPIC_PREFIX, "core")
+                .with(RelationalDatabaseConnectorConfig.MSG_KEY_COLUMNS, messageKeyColumns)
+                .build());
+    }
+
+    private static Table withExtraColumn(Table table, String name) {
+        return table.edit().addColumn(Column.editor().name(name).create()).create();
+    }
+
+    @Test
+    public void queryColumnsAreResolvedOncePerTableInstance() {
+        final CountingChunkQueryBuilder builder = new CountingChunkQueryBuilder(messageKeyColumnsConfig("s1.table1:pk2,pk1"));
+        final IncrementalSnapshotContext<TableId> context = new SignalBasedIncrementalSnapshotContext<>();
+        final Table table = createTwoPrimaryKeysTable();
+
+        final List<Column> first = builder.getQueryColumns(context, table);
+        for (int i = 0; i < 10_000; i++) {
+            assertThat(builder.getQueryColumns(context, table)).isSameAs(first);
+        }
+
+        assertThat(first).extracting(Column::name).containsExactly("pk2", "pk1");
+        assertThat(builder.keyMapperCalls).isEqualTo(1);
+    }
+
+    @Test
+    public void queryColumnsMatchTheUncachedKeyMapper() {
+        final RelationalDatabaseConnectorConfig config = messageKeyColumnsConfig("s1.table1:pk2,pk1;s1.other:val1;(.*).table2:val2");
+        final ChunkQueryBuilder<TableId> builder = new DefaultChunkQueryBuilder<>(config,
+                new JdbcConnection(config.getJdbcConfig(), c -> null, "\"", "\""));
+        final IncrementalSnapshotContext<TableId> context = new SignalBasedIncrementalSnapshotContext<>();
+        final Table table1 = createTwoPrimaryKeysTable();
+        final Table table2 = table1.edit().tableId(new TableId(null, "s1", "table2")).create();
+        final Table table3 = table1.edit().tableId(new TableId(null, "s1", "table3")).create();
+
+        for (Table table : List.of(table1, table2, table3, table1, table3)) {
+            assertThat(builder.getQueryColumns(context, table))
+                    .containsExactlyElementsOf(config.getKeyMapper().getKeyKolumns(table));
+        }
+        assertThat(builder.getQueryColumns(context, table2)).extracting(Column::name).containsExactly("val2");
+        assertThat(builder.getQueryColumns(context, table3)).extracting(Column::name).containsExactly("pk1", "pk2");
+    }
+
+    @Test
+    public void queryColumnsFollowASchemaChangeOfTheSameTable() {
+        final CountingChunkQueryBuilder builder = new CountingChunkQueryBuilder(messageKeyColumnsConfig("s1.table1:pk1,newkey"));
+        final IncrementalSnapshotContext<TableId> context = new SignalBasedIncrementalSnapshotContext<>();
+        final Table before = createTwoPrimaryKeysTable();
+        final Table after = withExtraColumn(before, "newkey");
+
+        assertThat(builder.getQueryColumns(context, before)).extracting(Column::name).containsExactly("pk1");
+        assertThat(builder.getQueryColumns(context, after)).extracting(Column::name).containsExactly("pk1", "newkey");
+        assertThat(builder.getQueryColumns(context, before)).extracting(Column::name).containsExactly("pk1");
+        assertThat(builder.keyMapperCalls).isEqualTo(3);
+    }
+
+    @Test
+    public void queryColumnsFollowTheSurrogateKeyOfTheCurrentRequest() {
+        final CountingChunkQueryBuilder builder = new CountingChunkQueryBuilder(config());
+        final Table table = createTwoPrimaryKeysTable();
+        final IncrementalSnapshotContext<TableId> noSurrogate = new SignalBasedIncrementalSnapshotContext<>();
+        final IncrementalSnapshotContext<TableId> surrogateVal1 = new SignalBasedIncrementalSnapshotContext<>();
+        surrogateVal1.addDataCollectionNamesToSnapshot("1", List.of(table.id().toString()), List.of(), "val1");
+        final IncrementalSnapshotContext<TableId> surrogateVal2 = new SignalBasedIncrementalSnapshotContext<>();
+        surrogateVal2.addDataCollectionNamesToSnapshot("2", List.of(table.id().toString()), List.of(), "val2");
+
+        assertThat(builder.getQueryColumns(noSurrogate, table)).extracting(Column::name).containsExactly("pk1", "pk2");
+        assertThat(builder.getQueryColumns(surrogateVal1, table)).extracting(Column::name).containsExactly("val1");
+        assertThat(builder.getQueryColumns(surrogateVal2, table)).extracting(Column::name).containsExactly("val2");
+        assertThat(builder.getQueryColumns(null, table)).extracting(Column::name).containsExactly("pk1", "pk2");
+        assertThat(builder.getQueryColumns(surrogateVal1, table)).extracting(Column::name).containsExactly("val1");
+    }
+
+    @Test
+    public void aMissingSurrogateKeyFailsOnEveryCall() {
+        final ChunkQueryBuilder<TableId> builder = new DefaultChunkQueryBuilder<>(config(),
+                new JdbcConnection(config().getJdbcConfig(), c -> null, "\"", "\""));
+        final Table table = createTwoPrimaryKeysTable();
+        final IncrementalSnapshotContext<TableId> context = new SignalBasedIncrementalSnapshotContext<>();
+        context.addDataCollectionNamesToSnapshot("1", List.of(table.id().toString()), List.of(), "sk");
+
+        for (int i = 0; i < 2; i++) {
+            assertThatThrownBy(() -> builder.getQueryColumns(context, table))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessage("Surrogate key \"sk\" doesn't exist in table \"s1.table1\"");
+        }
+    }
+
+    @Test
+    public void queryColumnsCannotBeModifiedByACaller() {
+        final ChunkQueryBuilder<TableId> builder = new DefaultChunkQueryBuilder<>(config(),
+                new JdbcConnection(config().getJdbcConfig(), c -> null, "\"", "\""));
+        final List<Column> columns = builder.getQueryColumns(new SignalBasedIncrementalSnapshotContext<>(), createTwoPrimaryKeysTable());
+
+        assertThatThrownBy(columns::clear).isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    public void queryColumnsKeepANullFromTheKeyMapper() {
+        // Table.primaryKeyColumns() maps a primary key name without a matching column to null
+        final Table table = createTwoPrimaryKeysTable();
+        final ChunkQueryBuilder<TableId> builder = new DefaultChunkQueryBuilder<>(config(),
+                new JdbcConnection(config().getJdbcConfig(), c -> null, "\"", "\"")) {
+            @Override
+            protected KeyMapper getKeyMapper() {
+                return t -> java.util.Arrays.asList(t.columnWithName("pk1"), null);
+            }
+        };
+
+        assertThat(builder.getQueryColumns(new SignalBasedIncrementalSnapshotContext<>(), table))
+                .containsExactly(table.columnWithName("pk1"), null);
     }
 
     private Table createTwoPrimaryKeysTable() {

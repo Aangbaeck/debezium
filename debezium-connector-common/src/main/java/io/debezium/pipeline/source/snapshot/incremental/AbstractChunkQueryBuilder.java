@@ -38,6 +38,7 @@ public abstract class AbstractChunkQueryBuilder<T extends DataCollectionId>
     protected final RelationalDatabaseConnectorConfig connectorConfig;
     protected final JdbcConnection jdbcConnection;
     protected ColumnNameFilter columnFilter;
+    private volatile QueryColumns lastQueryColumns;
 
     public AbstractChunkQueryBuilder(RelationalDatabaseConnectorConfig config,
                                      JdbcConnection jdbcConnection) {
@@ -355,18 +356,39 @@ public abstract class AbstractChunkQueryBuilder<T extends DataCollectionId>
         return getQueryColumns(context, table);
     }
 
+    /**
+     * Returns the columns the chunks of the table are keyed and ordered by: the surrogate key if the snapshot
+     * request names one, otherwise the key columns from {@code message.key.columns} or the primary key.
+     * <p>
+     * This is called for every row of a window, and a {@code message.key.columns} mapper tests each of its
+     * patterns against each column of the table, so the last result is kept for the same table instance and
+     * surrogate key. {@link Table} is immutable: a schema change or another table is a new instance.
+     */
     @Override
     public List<Column> getQueryColumns(IncrementalSnapshotContext<T> context, Table table) {
-        if (context != null && context.currentDataCollectionId() != null) {
-            Optional<String> surrogateKey = context.currentDataCollectionId().getSurrogateKey();
-            if (surrogateKey.isPresent()) {
-                Column column = table.columnWithName(surrogateKey.get());
-                if (column == null) {
-                    throw new IllegalArgumentException("Surrogate key \"" + surrogateKey.get() + "\" doesn't exist in table \"" + table.id() + "\"");
-                }
-                return Collections.singletonList(column);
+        final Optional<String> surrogateKey = context != null && context.currentDataCollectionId() != null
+                ? context.currentDataCollectionId().getSurrogateKey()
+                : Optional.empty();
+        final QueryColumns cached = lastQueryColumns;
+        if (cached != null && cached.table() == table && cached.surrogateKey().equals(surrogateKey)) {
+            return cached.columns();
+        }
+        final List<Column> columns = Collections.unmodifiableList(new ArrayList<>(computeQueryColumns(table, surrogateKey)));
+        lastQueryColumns = new QueryColumns(table, surrogateKey, columns);
+        return columns;
+    }
+
+    private List<Column> computeQueryColumns(Table table, Optional<String> surrogateKey) {
+        if (surrogateKey.isPresent()) {
+            Column column = table.columnWithName(surrogateKey.get());
+            if (column == null) {
+                throw new IllegalArgumentException("Surrogate key \"" + surrogateKey.get() + "\" doesn't exist in table \"" + table.id() + "\"");
             }
+            return Collections.singletonList(column);
         }
         return getKeyMapper().getKeyKolumns(table);
+    }
+
+    private record QueryColumns(Table table, Optional<String> surrogateKey, List<Column> columns) {
     }
 }
